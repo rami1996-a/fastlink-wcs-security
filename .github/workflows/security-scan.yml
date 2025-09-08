@@ -28,34 +28,33 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y unzip default-jdk android-tools-adb openvpn wget curl
 
-    # 4. Install Python security tools
-    - name: Install security tools
+    # 4. Install Python and binary security tools
+    - name: Install MobSFScan and Gitleaks
       run: |
-        # MobSFScan (Python)
+        # Install MobSFScan (Python)
         pip install mobsfscan
-        # Gitleaks (binary)
+
+        # Install Gitleaks (binary)
         wget https://github.com/zricethezav/gitleaks/releases/download/v8.19.1/gitleaks_8.19.1_linux_x64.tar.gz -O gitleaks.tar.gz
         tar -xvzf gitleaks.tar.gz
         sudo mv gitleaks /usr/local/bin/
         gitleaks version
-    - name: Install jq
-      run: sudo apt-get update && sudo apt-get install -y jq
 
-    - name: Install OSV Scanner
+    - name: Install OSV Scanner via Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: '1.22'
+
+    - name: Build OSV Scanner
       run: |
-        # Define the OSV Scanner version
-        OSV_SCANNER_VERSION="v2.1.0"
+        # Ensure Go bin is in PATH
+        export PATH=$PATH:$(go env GOPATH)/bin
 
-        # Construct the download URL
-        DOWNLOAD_URL="https://github.com/google/osv-scanner/releases/download/${OSV_SCANNER_VERSION}/osv-scanner-linux-amd64"
+        # Install OSV Scanner
+        go install github.com/google/osv-scanner/cmd/osv-scanner@latest
 
-        # Download and install OSV Scanner
-        wget "$DOWNLOAD_URL" -O osv-scanner
-        chmod +x osv-scanner
-        sudo mv osv-scanner /usr/local/bin/
+        # Verify installation
         osv-scanner --version
-
-
 
 
     # 5. Create reports folder
