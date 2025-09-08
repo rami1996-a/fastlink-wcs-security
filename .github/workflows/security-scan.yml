@@ -55,7 +55,13 @@ jobs:
         # Verify installation
         osv-scanner --version
 
-
+    # Install Drozer
+    - name: Install Drozer
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y openjdk-11-jdk python3-pip
+        pip install drozer
+        
     # 5. Connect to VPN
     - name: Connect to VPN
       env:
@@ -70,7 +76,7 @@ jobs:
     # 6. Static Analysis (MobSF)
     - name: Run MobSFScan (Static Analysis)
       run: |
-        mobsfscan app_decompiled --json > reports/mobsfscan.json || true
+        mobsfscan app_decompiled/AndroidManifest.xml --json > reports/mobsfscan.json || true
 
     # 7. Secrets Scan (Gitleaks)
     - name: Run Gitleaks (Secrets Scan)
@@ -80,7 +86,7 @@ jobs:
     # 8. Dependency / SCA Scan (OSV Scanner)
     - name: Run OSV Scanner (Dependency Analysis)
       run: |
-        osv-scanner --sbom=sbom.json --format=json > reports/osv.json || true
+        osv-scanner --sbom= app_decompiled/sbom.json --format=json > reports/osv.json || true
 
     # 9. Dynamic Analysis with Android Emulator
     - name: Launch Android Emulator & Run Dynamic Scan
