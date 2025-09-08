@@ -1,130 +1,78 @@
-name: APK Security Pipeline
+#!/bin/bash
+set -e
 
-on:
-  push:
-    branches: [ "main" ]
-  workflow_dispatch:
+REPORTS_DIR="reports/$(date +%Y%m%d_%H%M%S)"
+mkdir -p "$REPORTS_DIR"
 
-jobs:
-  apk-security:
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
+PACKAGE_NAME="org.fastlink.wsc.dev"
+APK_PATH="app.apk"
 
-    steps:
-    - name: Checkout repository (with LFS)
-      uses: actions/checkout@v4
-      with:
-        lfs: true
+echo "[+] Installing APK into emulator..."
+adb install -r "$APK_PATH" || true
 
-    - name: Setup Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.10'
+# Wait a moment for package to register
+sleep 3
 
-    - name: Create reports directory
-      run: mkdir -p reports
+echo "[+] Capturing package info (dumpsys & package manager)..."
+adb shell dumpsys package "$PACKAGE_NAME" > "$REPORTS_DIR/dumpsys_package.txt" || true
+adb shell pm list packages -f "$PACKAGE_NAME" > "$REPORTS_DIR/pm_list.txt" || true
+adb shell pm dump "$PACKAGE_NAME" > "$REPORTS_DIR/pm_dump.txt" || true
 
-    - name: Install system dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y unzip default-jdk android-tools-adb wget curl jq apktool ca-certificates
+echo "[+] Listing exported components via aapt (if available)..."
+aapt dump xmltree "$APK_PATH" AndroidManifest.xml > "$REPORTS_DIR/aapt_manifest_dump.txt" 2>/dev/null || true
 
-    - name: Install OpenFortiVPN (optional, for internal endpoints)
-      if: ${{ always() }}
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y openfortivpn || true
+echo "[+] Start capturing logcat in background..."
+adb logcat -c || true
+adb logcat -v time > "$REPORTS_DIR/logcat_live.txt" 2>&1 &
+LOGCAT_PID=$!
 
-    - name: Install Python and CLI tools
-      run: |
-        pip install --upgrade pip
-        pip install mobsfscan frida-tools objection syft
+# Give app a chance: launch main activity
+echo "[+] Launching app main activity..."
+adb shell monkey -p "$PACKAGE_NAME" -c android.intent.category.LAUNCHER 1 || true
 
-        # gitleaks binary
-        wget -q https://github.com/zricethezav/gitleaks/releases/download/v8.19.1/gitleaks_8.19.1_linux_x64.tar.gz -O gitleaks.tar.gz
-        tar -xvzf gitleaks.tar.gz
-        sudo mv gitleaks /usr/local/bin/ || true
-        gitleaks version || true
+# Do a UI stress for some interactions (non-deterministic but useful)
+echo "[+] Running UI monkey to generate traffic/events..."
+adb shell monkey -p "$PACKAGE_NAME" -v 100 || true
 
-        # Trivy (for APK quick CVE scan)
-        curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin v0.47.1 || true
+# Wait for actions to generate network/log entries
+sleep 10
 
-    - name: Install OWASP Dependency-Check CLI
-      run: |
-        # requires Java (default-jdk installed above)
-        DC_VER="8.4.1"
-        wget -q "https://github.com/jeremylong/DependencyCheck/releases/download/v${DC_VER}/dependency-check-${DC_VER}-release.zip" -O dc.zip
-        unzip -q dc.zip -d /tmp/dc
-        sudo mv /tmp/dc/dependency-check /opt/dependency-check
-        sudo ln -s /opt/dependency-check/bin/dependency-check.sh /usr/local/bin/dependency-check || true
-        dependency-check --version || true
+echo "[+] Dumping network-related info (netstat/processes)..."
+adb shell ps -A | grep "$PACKAGE_NAME" > "$REPORTS_DIR/process_list.txt" || true
+adb shell netstat -an > "$REPORTS_DIR/device_netstat.txt" || true
 
-    - name: (Optional) Connect to Fortinet VPN
-      if: ${{ secrets.VPN_USERNAME && secrets.VPN_PASSWORD }}
-      env:
-        VPN_USERNAME: ${{ secrets.VPN_USERNAME }}
-        VPN_PASSWORD: ${{ secrets.VPN_PASSWORD }}
-      run: |
-        mkdir -p vpn
-        echo -e "host = znkfw.newroztelecom.com\nport = 10443\nusername = $VPN_USERNAME\npassword = $VPN_PASSWORD\nset-dns = 1\nset-routes = 1\ntrusted-cert = d1766a4f0c0634b642d3d0e8dafc4b8f1258ed9dce9ee725ee19db9ce46fd233" > vpn/fastlink.conf
-        sudo openfortivpn -c vpn/fastlink.conf >/tmp/openforti.log 2>&1 & sleep 15 || true
-        echo "[+] VPN connection attempted"
-        # quick check (may fail in GH hosted runners if VPN or DNS blocked)
-        curl -I https://internal-api.company.local || true
+# Optional: try to take screenshot
+echo "[+] Capturing emulator screenshot..."
+adb exec-out screencap -p > "$REPORTS_DIR/emulator_screenshot.png" || true
 
-    - name: Decompile APK with apktool
-      run: |
-        apktool d app.apk -o app_decompiled || true
-        ls -la app_decompiled || true
+# Optional: attempt Frida instrumentation if available on runner & emulator
+if command -v frida-trace >/dev/null 2>&1 ; then
+  echo "[+] frida-trace detected on runner: attempting to run quick okhttp trace (non-blocking)..."
+  # attempt to push frida-server for x86_64 emulator (make sure matching frida version)
+  FRIDA_SERVER_BIN="frida-server-15.2.23-android-x86_64" # adjust if needed
+  if [ -f "tools/$FRIDA_SERVER_BIN" ]; then
+    adb push "tools/$FRIDA_SERVER_BIN" /data/local/tmp/frida-server || true
+    adb shell "chmod 755 /data/local/tmp/frida-server" || true
+    adb shell "/data/local/tmp/frida-server &" || true
+    sleep 3
+  fi
 
-    - name: Run MobSF static scan
-      run: |
-        mkdir -p reports
-        mobsfscan app_decompiled --json > reports/mobsfscan.json || true
+  # attempt a simple frida-trace for okhttp methods (runs short time)
+  timeout 20s frida-trace -U -i "open" -i "connect" -i "write" -i "read" "$PACKAGE_NAME" -o "$REPORTS_DIR/frida_trace" >/dev/null 2>&1 || echo "[!] frida-trace finished or failed"
+else
+  echo "[+] frida-trace not installed on runner; skipping Frida hooks."
+fi
 
-    - name: Run Gitleaks (secrets) on decompiled files
-      run: |
-        mkdir -p reports
-        gitleaks detect --source app_decompiled --report-path reports/gitleaks.json || true
+# Stop background logcat
+echo "[+] Stopping background logcat capture (pid $LOGCAT_PID)..."
+kill $LOGCAT_PID || true
+sleep 1
+adb logcat -d > "$REPORTS_DIR/logcat.txt" || true
 
-    - name: Generate SBOM from APK (Syft)
-      run: |
-        mkdir -p app_decompiled
-        syft app.apk -o spdx-json > app_decompiled/sbom.json || true
-        jq '.packages | length' app_decompiled/sbom.json || true
+# Pull prisma (if any) or app data (optional)
+# adb pull /data/data/org.fastlink.wsc.dev/databases "$REPORTS_DIR/" || true
 
-    - name: Trivy quick scan (APK)
-      run: |
-        mkdir -p reports
-        trivy fs --format json --output reports/trivy_apk.json app.apk || true
+echo "[+] Dynamic scan completed. Reports saved in $REPORTS_DIR"
+echo "Reports: $REPORTS_DIR"
 
-    - name: Run OWASP Dependency-Check on decompiled output
-      run: |
-        mkdir -p reports/dependency-check
-        # scan the decompiled folder for jars/native libs. This will attempt to find dependency info in classes/jars
-        dependency-check --project "fastlink-wsc" --scan app_decompiled --format ALL --out reports/dependency-check || true
-
-    - name: Launch Android Emulator & Run Dynamic Scan
-      uses: reactivecircus/android-emulator-runner@v2
-      with:
-        api-level: 30
-        target: default
-        arch: x86_64
-        profile: Nexus 6
-        script: |
-          chmod +x ./scripts/dynamic_scan.sh
-          ./scripts/dynamic_scan.sh
-
-    - name: Upload Security Reports
-      uses: actions/upload-artifact@v4
-      with:
-        name: security-reports
-        path: |
-          reports/**
-          app_decompiled/**
-
-    - name: Stop VPN
-      if: ${{ secrets.VPN_USERNAME && secrets.VPN_PASSWORD }}
-      run: |
-        sudo pkill openfortivpn || true
-        echo "[+] VPN stopped"
+exit 0
