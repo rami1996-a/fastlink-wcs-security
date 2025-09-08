@@ -70,17 +70,17 @@ jobs:
     # 6. Static Analysis (MobSF)
     - name: Run MobSFScan (Static Analysis)
       run: |
-        mobsfscan app.apk --json > reports/mobsfscan.json || true
+        mobsfscan . --json > reports/mobsfscan.json || true
 
     # 7. Secrets Scan (Gitleaks)
     - name: Run Gitleaks (Secrets Scan)
       run: |
-        gitleaks detect --source app.apk --report-path reports/gitleaks.json || true
+        gitleaks detect --source app_decompiled --report-path reports/gitleaks.json || true
 
     # 8. Dependency / SCA Scan (OSV Scanner)
     - name: Run OSV Scanner (Dependency Analysis)
       run: |
-        osv-scanner --sbom=app.apk --format=json > reports/osv.json || true
+        osv-scanner --sbom=sbom.json --format=json > reports/osv.json || true
 
     # 9. Dynamic Analysis with Android Emulator
     - name: Launch Android Emulator & Run Dynamic Scan
