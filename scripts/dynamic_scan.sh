@@ -17,6 +17,13 @@ adb install -r tools/drozer-agent.apk || true
 echo "[+] Forwarding Drozer port..."
 adb forward tcp:31415 tcp:31415
 
+# Wait until drozer agent responds
+until drozer console connect -c "run app.package.list" &> /dev/null; do
+    echo "[*] Waiting for Drozer agent to start..."
+    sleep 5
+done
+echo "[+] Drozer agent is ready"
+
 echo "[+] Waiting for Drozer agent to start..."
 sleep 15
 
