@@ -124,7 +124,7 @@ jobs:
           app_decompiled/**
 
     - name: Stop VPN
-      if: ${{ secrets.VPN_USERNAME && secrets.VPN_PASSWORD }}
+      if: ${{ secrets.EMAIL && secrets.VPN_PASSWORD }}
       run: |
         sudo pkill openfortivpn || true
         echo "[+] VPN stopped"
