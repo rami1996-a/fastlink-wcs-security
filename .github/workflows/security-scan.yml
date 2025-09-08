@@ -88,20 +88,6 @@ jobs:
           echo "[!] VPN secrets not provided - skipping VPN."
           exit 0
         fi
-
-        mkdir -p vpn
-        cat > vpn/fastlink.conf <<EOF
-host = znkfw.newroztelecom.com
-port = 10443
-username = "$VPN_EMAIL"
-password = "$VPN_PASSWORD"
-set-dns = 1
-set-routes = 1
-trusted-cert = d1766a4f0c0634b642d3d0e8dafc4b8f1258ed9dce9ee725ee19db9ce46fd233
-EOF
-        echo "[+] VPN config written (first lines):"
-        sed -n '1,6p' vpn/fastlink.conf || true
-
         # start openfortivpn in background (log to /tmp/openforti.log)
         sudo openfortivpn -c vpn/fastlink.conf >/tmp/openforti.log 2>&1 &
         sleep 20
