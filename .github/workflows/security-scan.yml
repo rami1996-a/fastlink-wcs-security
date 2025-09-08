@@ -57,11 +57,7 @@ jobs:
         osv-scanner --version
 
 
-    # 5. Create reports folder
-    - name: Create reports folder
-      run: mkdir -p reports
-
-    # 6. Connect to VPN
+    # 5. Connect to VPN
     - name: Connect to VPN
       env:
         VPN_EMAIL: ${{ secrets.VPN_EMAIL }}
@@ -72,22 +68,22 @@ jobs:
         echo "[+] VPN connection attempted"
         curl -I https://internal-api.company.local || true
 
-    # 7. Static Analysis (MobSF)
+    # 6. Static Analysis (MobSF)
     - name: Run MobSFScan (Static Analysis)
       run: |
-        mobsfscan apk/app.apk --json > reports/mobsfscan.json || true
+        mobsfscan app.apk --json > reports/mobsfscan.json || true
 
-    # 8. Secrets Scan (Gitleaks)
+    # 7. Secrets Scan (Gitleaks)
     - name: Run Gitleaks (Secrets Scan)
       run: |
         gitleaks detect --source . --report-path reports/gitleaks.json || true
 
-    # 9. Dependency / SCA Scan (OSV Scanner)
+    # 8. Dependency / SCA Scan (OSV Scanner)
     - name: Run OSV Scanner (Dependency Analysis)
       run: |
-        osv-scanner --sbom=apk/app.apk --format=json > reports/osv.json || true
+        osv-scanner --sbom=app.apk --format=json > reports/osv.json || true
 
-    # 10. Dynamic Analysis with Android Emulator
+    # 9. Dynamic Analysis with Android Emulator
     - name: Launch Android Emulator & Run Dynamic Scan
       uses: reactivecircus/android-emulator-runner@v2
       with:
@@ -97,7 +93,7 @@ jobs:
         profile: Nexus 6
         script: ./scripts/dynamic_scan.sh
 
-    # 11. Upload all reports as artifacts
+    # 10. Upload all reports as artifacts
     - name: Upload Security Reports
       uses: actions/upload-artifact@v4
       with:
