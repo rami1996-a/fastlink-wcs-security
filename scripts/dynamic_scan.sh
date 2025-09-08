@@ -8,7 +8,7 @@ mkdir -p "$REPORTS_DIR"
 PACKAGE_NAME="org.fastlink.wsc.dev"
 
 echo "[+] Installing APK into emulator..."
-adb install -r apk/app.apk || true
+adb install -r app.apk || true
 
 echo "[+] Running Drozer Dynamic Analysis..."
 
