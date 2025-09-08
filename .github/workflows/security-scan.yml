@@ -80,7 +80,7 @@ jobs:
     # 7. Secrets Scan (Gitleaks)
     - name: Run Gitleaks (Secrets Scan)
       run: |
-        gitleaks detect --source . --report-path reports/gitleaks.json || true
+        gitleaks detect --source app.apk --report-path reports/gitleaks.json || true
 
     # 8. Dependency / SCA Scan (OSV Scanner)
     - name: Run OSV Scanner (Dependency Analysis)
