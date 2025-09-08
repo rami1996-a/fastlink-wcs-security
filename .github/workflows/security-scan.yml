@@ -10,6 +10,10 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+    # Create reports folder
+    - name: Create reports folder
+      run: mkdir -p reports
+      
     # 1. Checkout repo and pull APK from Git LFS
     - name: Checkout repository (with LFS)
       uses: actions/checkout@v4
