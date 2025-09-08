@@ -47,9 +47,13 @@ jobs:
         pip install drozer
         
     # 5. Connect to VPN
+    - name: Install OpenFortiVPN
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y openfortivpn
     - name: Connect to VPN
       env:
-        VPN_USERNAME: ${{ secrets.VPN_USERNAME }}
+        VPN_USERNAME: ${{ secrets.VPN_EMAIL }}
         VPN_PASSWORD: ${{ secrets.VPN_PASSWORD }}
       run: |
         echo -e "host = znkfw.newroztelecom.com\nport = 10443\nusername = $VPN_USERNAME\npassword = $VPN_PASSWORD\nset-dns = 1\nset-routes = 1" > vpn/fastlink.conf
