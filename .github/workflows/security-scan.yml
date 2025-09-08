@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  apk-security:
+  apk-security: 
     runs-on: ubuntu-latest
     steps:
     # 1. Checkout repo and pull APK from Git LFS
