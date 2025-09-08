@@ -5,10 +5,9 @@ REPORTS_DIR="reports"
 mkdir -p $REPORTS_DIR
 
 echo "[+] Installing APK into emulator..."
-adb install app.apk || true
+adb install -r apk/app.apk || true
 
-echo "[+] Running Drozer (dynamic testing)..."
-# Example drozer checks – you can expand as needed
+echo "[+] Running Drozer (Dynamic Analysis)..."
 drozer console connect <<EOF > $REPORTS_DIR/drozer_report.txt
 run app.package.list
 run app.activity.info com.fastlink.wcs
