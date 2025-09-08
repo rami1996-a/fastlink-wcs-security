@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-# Directory to store reports
+# Directory to store reports (timestamped)
 REPORTS_DIR="reports/$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$REPORTS_DIR"
 
@@ -26,7 +26,7 @@ EOF
 echo "[+] Capturing Logcat..."
 adb logcat -d > "$REPORTS_DIR/logcat.txt"
 
-echo "[+] Capturing screenshot (optional)..."
+echo "[+] Capturing emulator screenshot..."
 adb exec-out screencap -p > "$REPORTS_DIR/emulator_screenshot.png"
 
 echo "[+] Dynamic scan completed. Reports saved in $REPORTS_DIR"
