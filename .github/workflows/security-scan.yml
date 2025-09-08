@@ -8,7 +8,7 @@ on:
 jobs:
   apk-security:
     runs-on: ubuntu-latest
-      
+    steps:
     # 1. Checkout repo and pull APK from Git LFS
     - name: Checkout repository (with LFS)
       uses: actions/checkout@v4
