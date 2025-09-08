@@ -60,7 +60,7 @@ jobs:
         dependency-check --version || true
 
     - name: (Optional) Connect to Fortinet VPN
-      if: ${{ secrets.VPN_USERNAME && secrets.VPN_PASSWORD }}
+      if: ${{ secrets.VPN_EMAIL && secrets.VPN_PASSWORD }}
       env:
         VPN_USERNAME: ${{ secrets.VPN_EMAIL }}
         VPN_PASSWORD: ${{ secrets.VPN_PASSWORD }}
