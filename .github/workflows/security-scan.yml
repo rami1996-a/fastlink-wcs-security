@@ -6,49 +6,54 @@ on:
   workflow_dispatch:
 
 jobs:
-  security-scan:
+  apk-security:
     runs-on: ubuntu-latest
 
     steps:
-    # 1. Checkout repo with LFS (to pull APK)
+    # 1. Checkout repo and pull APK from Git LFS
     - name: Checkout repository (with LFS)
       uses: actions/checkout@v4
       with:
         lfs: true
 
-    # 2. Setup Python for security tools
+    # 2. Setup Python (required for MobSF, Gitleaks, OSV)
     - name: Setup Python
       uses: actions/setup-python@v5
       with:
         python-version: '3.10'
 
-    # 3. Install dependencies & tools
-    - name: Install tools
+    # 3. Install system tools
+    - name: Install system dependencies
       run: |
-        sudo apt update && sudo apt install -y unzip default-jdk android-tools-adb
+        sudo apt-get update
+        sudo apt-get install -y unzip default-jdk android-tools-adb wget curl
+
+    # 4. Install security tools
+    - name: Install Python security tools
+      run: |
         pip install mobsfscan gitleaks osv-scanner
 
-    # Create reports folder
+    # 5. Create reports folder
     - name: Create reports folder
       run: mkdir -p reports
 
-    # 4. Static Analysis with MobSF
-    - name: Run MobSFScan (SAST)
+    # 6. Static Analysis (MobSF)
+    - name: Run MobSFScan (Static Analysis)
       run: |
-        mobsfscan app.apk --json > reports/mobsfscan.json || true
+        mobsfscan apk/app.apk --json > reports/mobsfscan.json || true
 
-    # 5. Secrets Scanning
-    - name: Run Gitleaks
+    # 7. Secrets Scan
+    - name: Run Gitleaks (Secrets Scan)
       run: |
         gitleaks detect --source . --report-path reports/gitleaks.json || true
 
-    # 6. Dependency Vulnerability Scan
-    - name: Run OSV Scanner (SCA)
+    # 8. Dependency / SCA Scan
+    - name: Run OSV Scanner (Dependency Analysis)
       run: |
-        osv-scanner --sbom=app.apk --format=json > reports/osv.json || true
+        osv-scanner --sbom=apk/app.apk --format=json > reports/osv.json || true
 
-    # 7. Dynamic Analysis – Launch Emulator
-    - name: Launch Android Emulator
+    # 9. Dynamic Analysis with Android Emulator
+    - name: Launch Android Emulator & Run Dynamic Scan
       uses: reactivecircus/android-emulator-runner@v2
       with:
         api-level: 30
@@ -57,8 +62,8 @@ jobs:
         profile: Nexus 6
         script: ./scripts/dynamic_scan.sh
 
-    # 8. Upload Reports
-    - name: Upload security reports
+    # 10. Upload all reports as artifacts
+    - name: Upload Security Reports
       uses: actions/upload-artifact@v4
       with:
         name: security-reports
