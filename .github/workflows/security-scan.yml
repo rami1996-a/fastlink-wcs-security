@@ -45,7 +45,7 @@ jobs:
       run: |
         # Fetch the latest release URL
         LATEST_RELEASE_URL=$(curl -s https://api.github.com/repos/google/osv-scanner/releases/latest | jq -r '.assets[] | select(.name == "osv-scanner-linux-amd64") | .browser_download_url')
-
+         echo "Latest OSV Scanner URL: $LATEST_RELEASE_URL"
         # Check if the URL was found
         if [ "$LATEST_RELEASE_URL" != "null" ]; then
           # Download and install OSV Scanner
