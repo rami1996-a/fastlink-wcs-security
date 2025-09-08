@@ -22,7 +22,7 @@ jobs:
       with:
         python-version: '3.10'
 
-    # 3. Install system tools
+    # 3. Install system dependencies
     - name: Install system dependencies
       run: |
         sudo apt-get update
@@ -46,7 +46,6 @@ jobs:
         sudo openvpn --config vpn/fastlink.ovpn --auth-user-pass <(echo -e "$VPN_EMAIL\n$VPN_PASSWORD") &
         sleep 15
         echo "[+] VPN connection attempted"
-        # Test connectivity (optional)
         curl -I https://internal-api.company.local || true
 
     # 7. Static Analysis (MobSF)
@@ -54,12 +53,12 @@ jobs:
       run: |
         mobsfscan apk/app.apk --json > reports/mobsfscan.json || true
 
-    # 8. Secrets Scan
+    # 8. Secrets Scan (Gitleaks)
     - name: Run Gitleaks (Secrets Scan)
       run: |
         gitleaks detect --source . --report-path reports/gitleaks.json || true
 
-    # 9. Dependency / SCA Scan
+    # 9. Dependency / SCA Scan (OSV Scanner)
     - name: Run OSV Scanner (Dependency Analysis)
       run: |
         osv-scanner --sbom=apk/app.apk --format=json > reports/osv.json || true
@@ -68,7 +67,7 @@ jobs:
     - name: Launch Android Emulator & Run Dynamic Scan
       uses: reactivecircus/android-emulator-runner@v2
       with:
-        api-level: 30
+        api-level: 35
         target: default
         arch: x86_64
         profile: Nexus 6
@@ -79,4 +78,4 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: security-reports
-        path: reports/
+        path: reports/**
