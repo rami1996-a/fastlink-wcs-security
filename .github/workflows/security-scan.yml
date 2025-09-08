@@ -70,7 +70,7 @@ jobs:
     # 6. Static Analysis (MobSF)
     - name: Run MobSFScan (Static Analysis)
       run: |
-        mobsfscan . --json > reports/mobsfscan.json || true
+        mobsfscan app_decompiled --json > reports/mobsfscan.json || true
 
     # 7. Secrets Scan (Gitleaks)
     - name: Run Gitleaks (Secrets Scan)
