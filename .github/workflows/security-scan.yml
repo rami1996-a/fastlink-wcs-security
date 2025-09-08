@@ -62,7 +62,7 @@ jobs:
     - name: (Optional) Connect to Fortinet VPN
       if: ${{ secrets.VPN_USERNAME && secrets.VPN_PASSWORD }}
       env:
-        VPN_USERNAME: ${{ secrets.VPN_USERNAME }}
+        VPN_USERNAME: ${{ secrets.VPN_EMAIL }}
         VPN_PASSWORD: ${{ secrets.VPN_PASSWORD }}
       run: |
         mkdir -p vpn
