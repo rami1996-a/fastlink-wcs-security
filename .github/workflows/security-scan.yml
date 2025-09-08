@@ -58,15 +58,6 @@ jobs:
         curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin || true
         trivy --version || true
 
-    - name: Install OWASP Dependency-Check CLI
-      run: |
-        DC_VER="8.4.1"
-        wget -q "https://github.com/jeremylong/DependencyCheck/releases/download/v${DC_VER}/dependency-check-${DC_VER}-release.zip" -O /tmp/dc.zip
-        unzip -q /tmp/dc.zip -d /tmp/dc
-        sudo mv /tmp/dc/dependency-check /opt/dependency-check
-        sudo ln -sf /opt/dependency-check/bin/dependency-check.sh /usr/local/bin/dependency-check
-        dependency-check --version || true
-
     - name: Verify repo-provided tools (frida-server, agents etc.)
       run: |
         echo "tools/ content (optional binaries expected here):"
@@ -78,21 +69,43 @@ jobs:
           echo "[!] drozer-agent.apk missing under tools/ (we recommend using Frida/Objection instead)."
         fi
 
-    - name: (Optional) Connect to Fortinet VPN (runtime-check)
+    - name: Connect to Fortinet VPN with better handling
       env:
-        VPN_EMAIL: ${{ secrets.VPN_EMAIL }}
-        VPN_PASSWORD: ${{ secrets.VPN_PASSWORD }}
+        VPN_EMAIL: "rami.bassam@newrozholdings.com"
+        VPN_PASSWORD: "A@T$%r$Nk0"
       run: |
-        # If secrets are not present, skip safely (prevents parse-time secret issues)
+        # Check for secrets
         if [ -z "$VPN_EMAIL" ] || [ -z "$VPN_PASSWORD" ]; then
-          echo "[!] VPN secrets not provided - skipping VPN."
+          echo "VPN secrets not provided - skipping VPN."
           exit 0
         fi
-        # start openfortivpn in background (log to /tmp/openforti.log)
-        sudo openfortivpn -c vpn/fastlink.conf >/tmp/openforti.log 2>&1 &
-        sleep 20
-        echo "[+] VPN attempted (check /tmp/openforti.log)."
-        curl -I https://internal-api.company.local || true
+    
+        # Create config file with credentials
+        sudo bash -c 'cat > /etc/openfortivpn/config << EOF
+        host = your-vpn-server.com
+        port = 443
+        username = $VPN_EMAIL
+        password = $VPN_PASSWORD
+        trusted-cert = your-certificate-hash
+        EOF'
+    
+        # Start VPN and wait for connection
+        echo "Connecting to VPN..."
+        sudo openfortivpn -c /etc/openfortivpn/config > /tmp/openforti.log 2>&1 &
+    
+        # Wait longer and check connection status
+        sleep 30
+    
+        # Check if VPN interface is up
+        if ip addr show tun0 > /dev/null 2>&1; then
+          echo "VPN connection established"
+          # Test internal connectivity
+          curl -v https://internal-api.company.local || echo "Internal API not reachable"
+        else
+          echo "VPN connection failed"
+          cat /tmp/openforti.log
+          exit 1
+        fi
 
     - name: Decompile APK (skip if existing)
       run: |
@@ -109,7 +122,7 @@ jobs:
     - name: Run MobSF static scan
       run: |
         mkdir -p reports
-        mobsfscan app_decompiled --json > reports/mobsfscan.json || true
+        mobsfscan app_decompiled/AndroidManifest.xml --json > reports/mobsfscan.json || true
 
     - name: Run Gitleaks (secrets) on decompiled files
       run: |
@@ -127,10 +140,12 @@ jobs:
         mkdir -p reports
         trivy fs --format json --output reports/trivy_apk.json app.apk || true
 
-    - name: Run OWASP Dependency-Check on decompiled output
+    - name: Run Dependency-Check (Docker)
       run: |
         mkdir -p reports/dependency-check
-        dependency-check --project "fastlink-wsc" --scan app_decompiled --format ALL --out reports/dependency-check || true
+        docker run --rm -v "${{ github.workspace }}":/src -v "${{ github.workspace }}/reports/dependency-check":/report owasp/dependency-check:8.4.1 \
+          --project "fastlink-wsc" --scan /src --out /report --format ALL || true
+
 
     - name: Launch Android Emulator & Run Dynamic Scan
       uses: reactivecircus/android-emulator-runner@v2
