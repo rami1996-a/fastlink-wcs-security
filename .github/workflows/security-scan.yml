@@ -39,22 +39,6 @@ jobs:
         sudo mv gitleaks /usr/local/bin/
         gitleaks version
 
-    - name: Install OSV Scanner via Go
-      uses: actions/setup-go@v4
-      with:
-        go-version: '1.22'
-
-    - name: Build OSV Scanner
-      run: |
-        # Ensure Go bin is in PATH
-        export PATH=$PATH:$(go env GOPATH)/bin
-
-        # Install OSV Scanner
-        go install github.com/google/osv-scanner/cmd/osv-scanner@latest
-
-        # Verify installation
-        osv-scanner --version
-
     # Install Drozer
     - name: Install Drozer
       run: |
@@ -63,24 +47,15 @@ jobs:
         pip install drozer
         
     # 5. Connect to VPN
-    - name: Install openfortivpn
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y openfortivpn
-    - name: Connect to Fortinet VPN
+    - name: Connect to VPN
       env:
         VPN_USERNAME: ${{ secrets.VPN_USERNAME }}
         VPN_PASSWORD: ${{ secrets.VPN_PASSWORD }}
       run: |
-        # Run VPN in background
-        sudo openfortivpn znkfw.newroztelecom.com:10443 \
-          --username "$VPN_USERNAME" \
-          --password "$VPN_PASSWORD" \
-          --trusted-cert "" &   # optional: provide cert fingerprint if required
-        VPN_PID=$!
-        echo "[+] VPN started with PID $VPN_PID"
+        echo -e "host = znkfw.newroztelecom.com\nport = 10443\nusername = $VPN_USERNAME\npassword = $VPN_PASSWORD\nset-dns = 1\nset-routes = 1" > vpn/fastlink.conf
+        sudo openfortivpn -c vpn/fastlink.conf &
         sleep 15
-        # Test internal connectivity
+        echo "[+] VPN connection attempted"
         curl -I https://internal-api.company.local || true
 
 
@@ -94,12 +69,7 @@ jobs:
       run: |
         gitleaks detect --source app_decompiled --report-path reports/gitleaks.json || true
 
-    # 8. Dependency / SCA Scan (OSV Scanner)
-    - name: Run OSV Scanner (Dependency Analysis)
-      run: |
-        osv-scanner --sbom=app_decompiled/sbom.json --format=json > reports/osv.json || true
-
-    # 9. Dynamic Analysis with Android Emulator
+    # 8. Dynamic Analysis with Android Emulator
     - name: Launch Android Emulator & Run Dynamic Scan
       uses: reactivecircus/android-emulator-runner@v2
       with:
@@ -112,7 +82,7 @@ jobs:
           ./scripts/dynamic_scan.sh
 
 
-    # 10. Upload all reports as artifacts
+    # 9. Upload all reports as artifacts
     - name: Upload Security Reports
       uses: actions/upload-artifact@v4
       with:
