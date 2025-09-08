@@ -44,7 +44,7 @@ jobs:
     - name: Install OSV Scanner
       run: |
         # Define the OSV Scanner version
-        OSV_SCANNER_VERSION="v2.2.2"
+        OSV_SCANNER_VERSION="v2.1.0"
 
         # Construct the download URL
         DOWNLOAD_URL="https://github.com/google/osv-scanner/releases/download/${OSV_SCANNER_VERSION}/osv-scanner-linux-amd64"
@@ -54,6 +54,7 @@ jobs:
         chmod +x osv-scanner
         sudo mv osv-scanner /usr/local/bin/
         osv-scanner --version
+
 
 
 
