@@ -69,38 +69,46 @@ jobs:
           echo "[!] drozer-agent.apk missing under tools/ (we recommend using Frida/Objection instead)."
         fi
 
-    - name: Connect to Fortinet VPN with better handling
-      env:
-        VPN_EMAIL: "rami.bassam@newrozholdings.com"
-        VPN_PASSWORD: "A@T$%r$Nk0"
+    - name: Install OpenFortiVPN client
       run: |
-        # Check for secrets
+        sudo apt-get update
+        sudo apt-get install -y openfortivpn
+
+    - name: Connect to Fortinet VPN
+      env:
+        VPN_EMAIL: ${{ secrets.VPN_EMAIL }}
+        VPN_PASSWORD: ${{ secrets.VPN_PASSWORD }}
+      run: |
+        # Check if secrets are available
         if [ -z "$VPN_EMAIL" ] || [ -z "$VPN_PASSWORD" ]; then
-          echo "VPN secrets not provided - skipping VPN."
+          echo "VPN secrets not provided - skipping VPN connection."
           exit 0
         fi
     
-        # Create config file with credentials
+        # Create config directory if it doesn't exist
+        sudo mkdir -p /etc/openfortivpn
+    
+        # Create config file (replace with your actual host and trusted-cert)
         sudo bash -c 'cat > /etc/openfortivpn/config << EOF
-        host = your-vpn-server.com
+        host = vpn.yourcompany.com
         port = 443
         username = $VPN_EMAIL
         password = $VPN_PASSWORD
-        trusted-cert = your-certificate-hash
+        trusted-cert = your_actual_certificate_hash_here
         EOF'
     
-        # Start VPN and wait for connection
+        # Connect to VPN
         echo "Connecting to VPN..."
-        sudo openfortivpn -c /etc/openfortivpn/config > /tmp/openforti.log 2>&1 &
+        sudo openfortivpn > /tmp/openforti.log 2>&1 &
     
-        # Wait longer and check connection status
-        sleep 30
+        # Wait for connection
+        sleep 15
     
-        # Check if VPN interface is up
-        if ip addr show tun0 > /dev/null 2>&1; then
-          echo "VPN connection established"
+        # Check if connection was successful
+        if grep -q "Connected" /tmp/openforti.log; then
+          echo "VPN connected successfully"
           # Test internal connectivity
-          curl -v https://internal-api.company.local || echo "Internal API not reachable"
+          curl -I https://internal-api.company.local || echo "Internal API test failed"
         else
           echo "VPN connection failed"
           cat /tmp/openforti.log
