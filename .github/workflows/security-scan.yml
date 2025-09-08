@@ -21,61 +21,104 @@ jobs:
       with:
         python-version: '3.10'
 
-    - name: Create reports directory
-      run: mkdir -p reports
+    - name: Create working dirs
+      run: |
+        mkdir -p reports
+        mkdir -p app_decompiled
+        mkdir -p vpn
+        mkdir -p tools
 
     - name: Install system dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y unzip default-jdk android-tools-adb wget curl jq apktool ca-certificates
+        sudo apt-get install -y unzip default-jdk android-tools-adb wget curl jq apktool ca-certificates git unzip zip
 
-    - name: Install OpenFortiVPN (optional, for internal endpoints)
-      if: ${{ always() }}
+    - name: Install OpenFortiVPN client (optional)
       run: |
         sudo apt-get update
         sudo apt-get install -y openfortivpn || true
 
-    - name: Install Python and CLI tools
+    - name: Install Python & CLI tools (MobSF, frida-tools, objection)
       run: |
-        pip install --upgrade pip
-        pip install mobsfscan frida-tools objection syft
+        python -m pip install --upgrade pip
+        pip install mobsfscan frida-tools objection || true
 
-        # gitleaks binary
-        wget -q https://github.com/zricethezav/gitleaks/releases/download/v8.19.1/gitleaks_8.19.1_linux_x64.tar.gz -O gitleaks.tar.gz
-        tar -xvzf gitleaks.tar.gz
-        sudo mv gitleaks /usr/local/bin/ || true
+        # Install gitleaks binary
+        GITLEAKS_VER="v8.19.1"
+        wget -q "https://github.com/zricethezav/gitleaks/releases/download/${GITLEAKS_VER}/gitleaks_${GITLEAKS_VER#v}_linux_x64.tar.gz" -O /tmp/gitleaks.tar.gz || true
+        tar -xzf /tmp/gitleaks.tar.gz -C /tmp || true
+        sudo mv /tmp/gitleaks /usr/local/bin/ || true
         gitleaks version || true
 
-        # Trivy (for APK quick CVE scan)
-        curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin v0.47.1 || true
+        # Install Syft (Anchore)
+        curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sudo sh -s -- -b /usr/local/bin || true
+        syft --version || true
+
+        # Install Trivy (Aqua)
+        curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin || true
+        trivy --version || true
 
     - name: Install OWASP Dependency-Check CLI
       run: |
-        # requires Java (default-jdk installed above)
         DC_VER="8.4.1"
-        wget -q "https://github.com/jeremylong/DependencyCheck/releases/download/v${DC_VER}/dependency-check-${DC_VER}-release.zip" -O dc.zip
-        unzip -q dc.zip -d /tmp/dc
+        wget -q "https://github.com/jeremylong/DependencyCheck/releases/download/v${DC_VER}/dependency-check-${DC_VER}-release.zip" -O /tmp/dc.zip
+        unzip -q /tmp/dc.zip -d /tmp/dc
         sudo mv /tmp/dc/dependency-check /opt/dependency-check
-        sudo ln -s /opt/dependency-check/bin/dependency-check.sh /usr/local/bin/dependency-check || true
+        sudo ln -sf /opt/dependency-check/bin/dependency-check.sh /usr/local/bin/dependency-check
         dependency-check --version || true
 
-    - name: (Optional) Connect to Fortinet VPN
-      if: ${{ secrets.VPN_EMAIL && secrets.VPN_PASSWORD }}
+    - name: Verify repo-provided tools (frida-server, agents etc.)
+      run: |
+        echo "tools/ content (optional binaries expected here):"
+        ls -la tools || true
+        if [ ! -f "tools/frida-server-android-x86_64" ]; then
+          echo "[!] frida-server-android-x86_64 missing under tools/ (optional)."
+        fi
+        if [ ! -f "tools/drozer-agent.apk" ]; then
+          echo "[!] drozer-agent.apk missing under tools/ (we recommend using Frida/Objection instead)."
+        fi
+
+    - name: (Optional) Connect to Fortinet VPN (runtime-check)
       env:
-        VPN_USERNAME: ${{ secrets.VPN_EMAIL }}
+        VPN_EMAIL: ${{ secrets.VPN_EMAIL }}
         VPN_PASSWORD: ${{ secrets.VPN_PASSWORD }}
       run: |
+        # If secrets are not present, skip safely (prevents parse-time secret issues)
+        if [ -z "$VPN_EMAIL" ] || [ -z "$VPN_PASSWORD" ]; then
+          echo "[!] VPN secrets not provided - skipping VPN."
+          exit 0
+        fi
+
         mkdir -p vpn
-        echo -e "host = znkfw.newroztelecom.com\nport = 10443\nusername = $VPN_USERNAME\npassword = $VPN_PASSWORD\nset-dns = 1\nset-routes = 1\ntrusted-cert = d1766a4f0c0634b642d3d0e8dafc4b8f1258ed9dce9ee725ee19db9ce46fd233" > vpn/fastlink.conf
-        sudo openfortivpn -c vpn/fastlink.conf >/tmp/openforti.log 2>&1 & sleep 15 || true
-        echo "[+] VPN connection attempted"
-        # quick check (may fail in GH hosted runners if VPN or DNS blocked)
+        cat > vpn/fastlink.conf <<EOF
+host = znkfw.newroztelecom.com
+port = 10443
+username = "$VPN_EMAIL"
+password = "$VPN_PASSWORD"
+set-dns = 1
+set-routes = 1
+trusted-cert = d1766a4f0c0634b642d3d0e8dafc4b8f1258ed9dce9ee725ee19db9ce46fd233
+EOF
+        echo "[+] VPN config written (first lines):"
+        sed -n '1,6p' vpn/fastlink.conf || true
+
+        # start openfortivpn in background (log to /tmp/openforti.log)
+        sudo openfortivpn -c vpn/fastlink.conf >/tmp/openforti.log 2>&1 &
+        sleep 20
+        echo "[+] VPN attempted (check /tmp/openforti.log)."
         curl -I https://internal-api.company.local || true
 
-    - name: Decompile APK with apktool
+    - name: Decompile APK (skip if existing)
       run: |
-        apktool d app.apk -o app_decompiled || true
-        ls -la app_decompiled || true
+        if [ -d "app_decompiled" ] && [ "$(ls -A app_decompiled)" ]; then
+          echo "[+] app_decompiled exists and is not empty — skipping decompile."
+          ls -la app_decompiled | sed -n '1,200p'
+        else
+          echo "[+] Decompiling app.apk -> app_decompiled"
+          apktool d app.apk -o app_decompiled || true
+          echo "[+] Decompile done:"
+          ls -la app_decompiled | sed -n '1,200p'
+        fi
 
     - name: Run MobSF static scan
       run: |
@@ -89,9 +132,9 @@ jobs:
 
     - name: Generate SBOM from APK (Syft)
       run: |
-        mkdir -p app_decompiled
         syft app.apk -o spdx-json > app_decompiled/sbom.json || true
-        jq '.packages | length' app_decompiled/sbom.json || true
+        echo "SBOM packages count:"; jq '.packages | length' app_decompiled/sbom.json || true
+        jq '(.packages[]? | {purl: .purl, name: .name, version: .version})' app_decompiled/sbom.json > reports/sbom_packages.json || true
 
     - name: Trivy quick scan (APK)
       run: |
@@ -101,7 +144,6 @@ jobs:
     - name: Run OWASP Dependency-Check on decompiled output
       run: |
         mkdir -p reports/dependency-check
-        # scan the decompiled folder for jars/native libs. This will attempt to find dependency info in classes/jars
         dependency-check --project "fastlink-wsc" --scan app_decompiled --format ALL --out reports/dependency-check || true
 
     - name: Launch Android Emulator & Run Dynamic Scan
@@ -123,8 +165,8 @@ jobs:
           reports/**
           app_decompiled/**
 
-    - name: Stop VPN
-      if: ${{ secrets.EMAIL && secrets.VPN_PASSWORD }}
+    - name: Stop VPN (best-effort)
+      if: ${{ always() }}
       run: |
         sudo pkill openfortivpn || true
-        echo "[+] VPN stopped"
+        echo "[+] VPN stopped (if it was running)"
