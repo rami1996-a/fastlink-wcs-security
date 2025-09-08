@@ -10,6 +10,16 @@ PACKAGE_NAME="org.fastlink.wsc.dev"
 echo "[+] Installing APK into emulator..."
 adb install -r app.apk || true
 
+echo "[+] Installing Drozer Agent into emulator..."
+# Adjust the path to your drozer-agent.apk
+adb install -r tools/drozer-agent.apk || true
+
+echo "[+] Forwarding Drozer port..."
+adb forward tcp:31415 tcp:31415
+
+echo "[+] Waiting for Drozer agent to start..."
+sleep 15
+
 echo "[+] Running Drozer Dynamic Analysis..."
 
 # Connect to Drozer and run component enumeration
