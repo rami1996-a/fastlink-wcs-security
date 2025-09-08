@@ -38,11 +38,25 @@ jobs:
         tar -xvzf gitleaks.tar.gz
         sudo mv gitleaks /usr/local/bin/
         gitleaks version
-        # OSV Scanner (binary)
-        wget https://github.com/google/osv-scanner/releases/download/v0.12.0/osv-scanner-linux-amd64 -O osv-scanner
-        chmod +x osv-scanner
-        sudo mv osv-scanner /usr/local/bin/
-        osv-scanner --version
+    - name: Install jq
+      run: sudo apt-get update && sudo apt-get install -y jq
+
+    - name: Install OSV Scanner
+      run: |
+        # Fetch the latest release URL
+        LATEST_RELEASE_URL=$(curl -s https://api.github.com/repos/google/osv-scanner/releases/latest | jq -r '.assets[] | select(.name == "osv-scanner-linux-amd64") | .browser_download_url')
+
+        # Check if the URL was found
+        if [ "$LATEST_RELEASE_URL" != "null" ]; then
+          # Download and install OSV Scanner
+          wget "$LATEST_RELEASE_URL" -O osv-scanner
+          chmod +x osv-scanner
+          sudo mv osv-scanner /usr/local/bin/
+          osv-scanner --version
+        else
+          echo "OSV Scanner binary for linux-amd64 not found in the latest release."
+          exit 1
+        fi
 
 
     # 5. Create reports folder
