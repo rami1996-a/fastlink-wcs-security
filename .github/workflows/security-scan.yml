@@ -63,15 +63,26 @@ jobs:
         pip install drozer
         
     # 5. Connect to VPN
-    - name: Connect to VPN
+    - name: Install openfortivpn
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y openfortivpn
+    - name: Connect to Fortinet VPN
       env:
-        VPN_EMAIL: ${{ secrets.VPN_EMAIL }}
+        VPN_USERNAME: ${{ secrets.VPN_USERNAME }}
         VPN_PASSWORD: ${{ secrets.VPN_PASSWORD }}
       run: |
-        sudo openvpn --config vpn/fastlink.ovpn --auth-user-pass <(echo -e "$VPN_EMAIL\n$VPN_PASSWORD") &
+        # Run VPN in background
+        sudo openfortivpn znkfw.newroztelecom.com:10443 \
+          --username "$VPN_USERNAME" \
+          --password "$VPN_PASSWORD" \
+          --trusted-cert "" &   # optional: provide cert fingerprint if required
+        VPN_PID=$!
+        echo "[+] VPN started with PID $VPN_PID"
         sleep 15
-        echo "[+] VPN connection attempted"
+        # Test internal connectivity
         curl -I https://internal-api.company.local || true
+
 
     # 6. Static Analysis (MobSF)
     - name: Run MobSFScan (Static Analysis)
@@ -86,7 +97,7 @@ jobs:
     # 8. Dependency / SCA Scan (OSV Scanner)
     - name: Run OSV Scanner (Dependency Analysis)
       run: |
-        osv-scanner --sbom= app_decompiled/sbom.json --format=json > reports/osv.json || true
+        osv-scanner --sbom=app_decompiled/sbom.json --format=json > reports/osv.json || true
 
     # 9. Dynamic Analysis with Android Emulator
     - name: Launch Android Emulator & Run Dynamic Scan
@@ -107,3 +118,7 @@ jobs:
       with:
         name: security-reports
         path: reports/**
+    - name: Stop VPN
+      run: |
+        sudo pkill openfortivpn || true
+        echo "[+] VPN stopped"
