@@ -32,12 +32,18 @@ jobs:
     - name: Install security tools
       run: |
         # MobSFScan (Python)
-        pip install mobsfscan osv-scanner
+        pip install mobsfscan
         # Gitleaks (binary)
         wget https://github.com/zricethezav/gitleaks/releases/download/v8.19.1/gitleaks_8.19.1_linux_x64.tar.gz -O gitleaks.tar.gz
         tar -xvzf gitleaks.tar.gz
         sudo mv gitleaks /usr/local/bin/
         gitleaks version
+        # OSV Scanner (binary)
+        wget https://github.com/google/osv-scanner/releases/download/v0.12.0/osv-scanner-linux-amd64 -O osv-scanner
+        chmod +x osv-scanner
+        sudo mv osv-scanner /usr/local/bin/
+        osv-scanner --version
+
 
     # 5. Create reports folder
     - name: Create reports folder
