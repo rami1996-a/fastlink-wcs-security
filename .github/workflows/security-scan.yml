@@ -91,10 +91,10 @@ jobs:
         target: default
         arch: x86_64
         profile: Nexus 6
-    - name: Run dynamic scan
-      run: |
-        chmod +x ./scripts/dynamic_scan.sh
-        ./scripts/dynamic_scan.sh
+        script: |
+          chmod +x ./scripts/dynamic_scan.sh
+          ./scripts/dynamic_scan.sh
+
 
     # 10. Upload all reports as artifacts
     - name: Upload Security Reports
