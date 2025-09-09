@@ -74,14 +74,16 @@ jobs:
         VPN_EMAIL: ${{ secrets.VPN_EMAIL }}
         VPN_PASSWORD: ${{ secrets.VPN_PASSWORD }}
       run: |
+        # Exit if VPN secrets are missing
         if [ -z "$VPN_EMAIL" ] || [ -z "$VPN_PASSWORD" ]; then
-          echo "VPN secrets not provided - skipping VPN connection."
+          echo "[!] VPN secrets not provided - skipping VPN connection."
           exit 0
         fi
 
-        sudo mkdir -p /etc/openfortivpn
+        # Ensure reports folder exists
+        mkdir -p reports
 
-        # Write config with proper variable expansion (note the use of EOF without single quotes)
+        # Write config with proper variable expansion
         cat <<EOF | sudo tee /etc/openfortivpn/config > /dev/null
         host = znkfw.newroztelecom.com
         port = 10443
@@ -92,18 +94,44 @@ jobs:
         trusted-cert = d1766a4f0c0634b642d3d0e8dafc4b8f1258ed9dce9ee725ee19db9ce46fd233
         EOF
 
-        echo "Connecting to VPN..."
-        sudo openfortivpn -c /etc/openfortivpn/config > /tmp/openforti.log 2>&1 &
-        sleep 15
+        echo "[+] Connecting to VPN..."
+        sudo openfortivpn -c /etc/openfortivpn/config > reports/openforti.log 2>&1 &
+        PID=$!
 
-        if grep -q "Connected" /tmp/openforti.log; then
-          echo "VPN connected successfully"
-          curl -I https://internal-api.company.local || echo "Internal API test failed"
-        else
-          echo "VPN connection failed"
-          cat /tmp/openforti.log
+        # Wait for VPN to establish
+        TIMEOUT=30
+        INTERVAL=2
+        waited=0
+        while [ $waited -lt $TIMEOUT ]; do
+          if grep -qi "connected" reports/openforti.log >/dev/null 2>&1; then
+            echo "[+] VPN connected successfully"
+            break
+          fi
+          if ! kill -0 "$PID" >/dev/null 2>&1; then
+            echo "[!] openfortivpn process exited unexpectedly. Dumping log:"
+            tail -n 50 reports/openforti.log
+            exit 1
+          fi
+          sleep $INTERVAL
+          waited=$((waited + INTERVAL))
+        done
+
+        if [ $waited -ge $TIMEOUT ]; then
+          echo "[!] VPN did not establish within ${TIMEOUT}s. Tail of log:"
+          tail -n 50 reports/openforti.log
+          sudo kill "$PID" || true
           exit 1
         fi
+
+        # Optional internal API test (does NOT fail workflow)
+        echo "[*] Testing internal API (may fail on GitHub runners)"
+        if ! curl -I https://internal-api.company.local >/dev/null 2>&1; then
+          echo "[!] Internal API unreachable — likely expected on CI."
+        else
+          echo "[+] Internal API reachable"
+        fi
+      shell: /usr/bin/bash -e {0}
+
 
     - name: Decompile APK (skip if existing)
       run: |
@@ -138,11 +166,18 @@ jobs:
         mkdir -p reports
         trivy fs --format json --output reports/trivy_apk.json app.apk || true
 
-    - name: Run Dependency-Check (Docker)
+    - name: Run OWASP Dependency-Check
       run: |
         mkdir -p reports/dependency-check
-        docker run --rm -v "${{ github.workspace }}":/src -v "${{ github.workspace }}/reports/dependency-check":/report owasp/dependency-check:8.4.1 \
-          --project "fastlink-wsc" --scan /src --out /report --format ALL || true
+        docker run --rm \
+          -v "${{ github.workspace }}":/src \
+          -v "${{ github.workspace }}/reports/dependency-check":/report \
+          owasp/dependency-check:8.5.3 \
+          --project "fastlink-wsc" \
+          --scan /src \
+          --out /report \
+          --format ALL || true
+
 
 
     - name: Launch Android Emulator & Run Dynamic Scan
