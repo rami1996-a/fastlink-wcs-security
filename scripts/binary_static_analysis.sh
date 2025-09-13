@@ -2,8 +2,8 @@
 # binary_static_analysis.sh <ipa_file> <output_dir>
 set -euo pipefail
 
-IPA="$1"
-OUTDIR="$2"
+IPA="${1:-}"
+OUTDIR="${2:-pentest-artifacts}"
 mkdir -p "$OUTDIR"
 
 if [ -z "$IPA" ] || [ ! -f "$IPA" ]; then
@@ -15,7 +15,7 @@ TMPDIR=$(mktemp -d)
 cleanup() { rm -rf "$TMPDIR"; }
 trap cleanup EXIT
 
-unzip -qq "$IPA" -d "$TMPDIR"
+unzip -qq "$IPA" -d "$TMPDIR" || { echo "[binary] unzip failed"; exit 0; }
 
 APPDIR=$(find "$TMPDIR/Payload" -maxdepth 2 -type d -name "*.app" | head -n1 || true)
 if [ -z "$APPDIR" ]; then
@@ -56,50 +56,51 @@ echo "--------------------------------------------------" >> "$REPORT"
 echo -e "\n[File info]" >> "$REPORT"
 file "$BINPATH" >> "$REPORT" 2>&1 || true
 
-# otool / linked libs
-echo -e "\n[Linked libraries / rpaths]" >> "$REPORT"
-if command -v otool >/dev/null 2>&1; then
-  otool -L "$BINPATH" >> "$REPORT" 2>&1 || true
+# Determine file type and runner OS compatibility
+FILETYPE=$(file "$BINPATH" | tr -d '\n')
+echo "[binary] file type: $FILETYPE" >> "$REPORT"
+
+# Only attempt nm/otool on compatible platforms
+if echo "$FILETYPE" | grep -i "Mach-O" >/dev/null 2>&1; then
+  # Mach-O on Linux: nm/otool may not understand; detect availability and try safely
+  if command -v otool >/dev/null 2>&1; then
+    echo -e "\n[Linked libraries / rpaths]" >> "$REPORT"
+    otool -L "$BINPATH" >> "$REPORT" 2>&1 || true
+  else
+    echo "otool not available on this runner (skipped)" >> "$REPORT"
+  fi
+
+  if command -v nm >/dev/null 2>&1; then
+    # nm may still error for arm64 Mach-O on Linux; capture stderr and continue
+    if nm -n "$BINPATH" > "$OUTDIR/binary-nm-head.txt" 2> "$OUTDIR/binary-nm-err.txt"; then
+      echo "[nm] saved to binary-nm-head.txt" >> "$REPORT"
+    else
+      echo "[nm] failed or not supported for this binary; see binary-nm-err.txt" >> "$REPORT"
+    fi
+  else
+    echo "nm not present; skipping symbol dump" >> "$REPORT"
+  fi
 else
-  echo "otool: not present on this runner (skipped)" >> "$REPORT"
+  # Not Mach-O (or other format) — try nm/objdump best-effort
+  if command -v nm >/dev/null 2>&1; then
+    nm -n "$BINPATH" | head -n 200 > "$OUTDIR/binary-nm-head.txt" 2>/dev/null || true
+  fi
 fi
 
-# strings (top)
-strings "$BINPATH" | sed -n '1,500p' > "$OUTDIR/binary-strings-top.txt" || true
-
-echo -e "\n[Suspect strings]" >> "$REPORT"
+# strings & suspect keywords (always useful)
+strings "$BINPATH" | sed -n '1,1000p' > "$OUTDIR/binary-strings-top.txt" || true
 strings "$BINPATH" | egrep -i "http://|https://|api[_-]?key|apiKey|access[_-]?token|secret|password|BEGIN RSA PRIVATE KEY|AWS|oauth|jwt" | sort -u > "$OUTDIR/binary-suspect-strings.txt" || true
-cat "$OUTDIR/binary-suspect-strings.txt" >> "$REPORT" || true
-
-# nm (symbols) head
-if command -v nm >/dev/null 2>&1; then
-  nm -n "$BINPATH" | head -n 300 > "$OUTDIR/binary-nm-head.txt" || true
-  echo "[nm output saved]" >> "$REPORT"
-else
-  echo "nm: not present (skipped)" >> "$REPORT"
-fi
+echo -e "\n[Suspect strings summary]" >> "$REPORT"
+head -n 200 "$OUTDIR/binary-suspect-strings.txt" >> "$REPORT" 2>/dev/null || true
 
 # class-dump if available
 if command -v class-dump >/dev/null 2>&1; then
   mkdir -p "$OUTDIR/classdump-headers"
   class-dump -H "$BINPATH" -o "$OUTDIR/classdump-headers" 2>/dev/null || true
-  echo "class-dump: headers saved to $OUTDIR/classdump-headers" >> "$REPORT"
+  echo "class-dump: headers (if produced) saved to $OUTDIR/classdump-headers" >> "$REPORT"
 else
   echo "class-dump not found (skipped)" >> "$REPORT"
 fi
-
-# quick Mach-O basic info via macholib (if installed)
-python3 - <<PY > "$OUTDIR/mach-o-info.txt" 2>/dev/null || true
-try:
-  import sys
-  import os
-  with open("$BINPATH","rb") as f:
-    data=f.read(256)
-  print("first256bytes:", data[:256].hex())
-except Exception as e:
-  print("error:", e)
-PY
-echo "mach-o info saved" >> "$REPORT"
 
 # entropy (first 200k)
 python3 - <<PY > "$OUTDIR/binary-entropy.txt"
@@ -117,20 +118,17 @@ print(entropy(b[:200000]))
 PY
 echo "entropy saved" >> "$REPORT"
 
-# save resources (Info.plist, storyboards, nibs, mobileprovision)
+# save some resources (Info.plist, storyboards, nibs, mobileprovision)
 mkdir -p "$OUTDIR/resources"
 cp "$APPDIR/Info.plist" "$OUTDIR/resources/" 2>/dev/null || true
 find "$APPDIR" -type f \( -name "*.storyboardc" -o -name "*.nib" -o -name "*.plist" -o -name "*.strings" -o -name "*.mobileprovision" \) -maxdepth 4 -exec cp --parents {} "$OUTDIR/resources" \; 2>/dev/null || true
 
-# log summary
 echo -e "\n[Summary]" >> "$REPORT"
-echo "Suspect strings file: $OUTDIR/binary-suspect-strings.txt" >> "$REPORT"
-echo "Top strings file: $OUTDIR/binary-strings-top.txt" >> "$REPORT"
-echo "NM head: $OUTDIR/binary-nm-head.txt (if present)" >> "$REPORT"
-echo "Class-dump folder: $OUTDIR/classdump-headers (if generated)" >> "$REPORT"
-echo "Mach-O info: $OUTDIR/mach-o-info.txt" >> "$REPORT"
-echo "Entropy: $OUTDIR/binary-entropy.txt" >> "$REPORT"
-echo "Resources copied to: $OUTDIR/resources" >> "$REPORT"
+echo "Suspect strings -> $OUTDIR/binary-suspect-strings.txt" >> "$REPORT"
+echo "Top strings -> $OUTDIR/binary-strings-top.txt" >> "$REPORT"
+echo "NM head -> $OUTDIR/binary-nm-head.txt (if present)" >> "$REPORT"
+echo "Class-dump folder -> $OUTDIR/classdump-headers (if generated)" >> "$REPORT"
+echo "Entropy -> $OUTDIR/binary-entropy.txt" >> "$REPORT"
+echo "Resources copied to -> $OUTDIR/resources" >> "$REPORT"
 
 echo "[binary] done. Reports in $OUTDIR"
-
