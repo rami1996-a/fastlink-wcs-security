@@ -7,6 +7,16 @@ on:
         description: 'Path to IPA in repo (relative). If empty pipeline will attempt to build from Xcode project.'
         required: false
         default: 'ios.ipa'
+  push:
+    branches:
+      - main
+    paths:
+      - '**/*.ipa'
+      - 'scripts/**'
+      - '**/*.swift'
+  pull_request:
+    branches:
+      - main
 
 # allow all runs (do not cancel-in-progress)
 concurrency:
@@ -55,6 +65,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Ensure scripts executable (job-level)
+        run: chmod +x ${{ env.SCRIPT_DIR }}/*.sh || true
+
       - name: Start MobSF Docker (no API key required)
         run: |
           docker run --rm -d --name mobsf -p ${MOBSF_PORT}:8000 opensecurity/mobile-security-framework-mobsf:latest
@@ -98,6 +111,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Ensure scripts executable (job-level)
+        run: chmod +x ${{ env.SCRIPT_DIR }}/*.sh || true
+
       - name: Install packages required by script
         run: |
           sudo apt-get update -y
@@ -119,7 +135,7 @@ jobs:
           path: ${{ env.ARTIFACT_DIR }}/binary-*,${{ env.ARTIFACT_DIR }}/classdump-headers/**
           if-no-files-found: ignore
 
-  # Dependency scanning using your deps_scan.sh
+  # Dependency scanning using your deps_scan.sh (no CodeQL here)
   deps_and_codeql:
     needs: prep
     runs-on: ubuntu-latest
@@ -128,23 +144,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Ensure scripts executable (job-level)
+        run: chmod +x ${{ env.SCRIPT_DIR }}/*.sh || true
+
       - name: Run deps_scan script (OWASP DC)
         run: |
           mkdir -p ${{ env.ARTIFACT_DIR }}
           ${SCRIPT_DIR}/deps_scan.sh "${{ env.ARTIFACT_DIR }}" || true
 
-      - name: Initialize CodeQL (Swift)
-        uses: github/codeql-action/init@v2
-        with:
-          languages: 'swift'
-      - name: Autobuild (CodeQL)
-        uses: github/codeql-action/autobuild@v2
-      - name: Run CodeQL analyze
-        uses: github/codeql-action/analyze@v2
-        with:
-          category: 'security'
-
-      - name: Upload dependency-check & CodeQL artifacts
+      - name: Upload dependency-check artifacts
         uses: actions/upload-artifact@v4
         with:
           name: deps-reports
@@ -160,6 +168,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Ensure scripts executable (job-level)
+        run: chmod +x ${{ env.SCRIPT_DIR }}/*.sh || true
+
       - name: Run secret scan script
         run: |
           mkdir -p ${{ env.ARTIFACT_DIR }}
@@ -172,29 +183,36 @@ jobs:
           path: ${{ env.ARTIFACT_DIR }}/detect-secrets.json,${{ env.ARTIFACT_DIR }}/trufflehog-local.json
           if-no-files-found: ignore
 
-  # macOS runtime/build job - keep as-is but run collect_reports on mac if you created artifacts there
+  # macOS runtime/build job - runs CodeQL for Swift here (macOS-only)
   macos_runtime:
     needs: prep
     runs-on: macos-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Make scripts executable on macOS
-        run: |
-          chmod +x ${{ env.SCRIPT_DIR }}/*.sh || true
+      - name: Ensure scripts executable (macOS)
+        run: chmod +x ${{ env.SCRIPT_DIR }}/*.sh || true
 
-      - name: Attempt simulator build (no signing)
+      - name: Initialize CodeQL (Swift) on macOS
+        uses: github/codeql-action/init@v2
+        with:
+          languages: 'swift'
+
+      - name: Attempt simulator build (no signing) — used by CodeQL and runtime checks
         run: |
+          set -e
           if ls *.xcworkspace 1> /dev/null 2>&1 || ls *.xcodeproj 1> /dev/null 2>&1; then
             WORKSPACE=$(ls *.xcworkspace 2>/dev/null | head -n1 || true)
             PROJECT=$(ls *.xcodeproj 2>/dev/null | head -n1 || true)
             if [ -n "$WORKSPACE" ]; then
               SCHEME="$(basename ${WORKSPACE%.*})"
+              echo "Building workspace: $WORKSPACE ; scheme: $SCHEME"
               xcodebuild -workspace "$WORKSPACE" -scheme "$SCHEME" -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPhone 14,OS=latest' clean build || true
             elif [ -n "$PROJECT" ]; then
               SCHEME="$(basename ${PROJECT%.*})"
+              echo "Building project: $PROJECT ; scheme: $SCHEME"
               xcodebuild -project "$PROJECT" -scheme "$SCHEME" -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPhone 14,OS=latest' clean build || true
             else
               echo "No Xcode project/workspace found; skipping build"
@@ -202,6 +220,15 @@ jobs:
           else
             echo "No xcode project/workspace present"
           fi
+
+      - name: (Optional) Runtime checks + Frida notes
+        run: |
+          echo "Note: runtime instrumentation (Frida) is limited in CI; for deeper runtime tests use a device or self-hosted macOS runner."
+
+      - name: Run CodeQL analyze (Swift)
+        uses: github/codeql-action/analyze@v2
+        with:
+          category: 'security'
 
       - name: Upload macos artifacts (if any)
         uses: actions/upload-artifact@v4
@@ -218,6 +245,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Ensure scripts executable (job-level)
+        run: chmod +x ${{ env.SCRIPT_DIR }}/*.sh || true
+
       - name: Run collect_reports.sh to create final archive
         run: |
           mkdir -p ${{ env.ARTIFACT_DIR }}
@@ -229,4 +259,3 @@ jobs:
           name: pentest-all-reports
           path: ${{ env.ARTIFACT_DIR }}/pentest-all-reports.tar.gz
           if-no-files-found: ignore
-
