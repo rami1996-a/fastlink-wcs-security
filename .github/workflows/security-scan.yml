@@ -1,4 +1,4 @@
-name: iOS Pentest Pipeline (Inline Scripts)
+name: iOS Pentest Pipeline (Inline Scripts, Validated)
 
 on:
   workflow_dispatch:
@@ -43,14 +43,14 @@ jobs:
         run: |
           set -euo pipefail
           if [ -n "${{ github.event.inputs.artifact_path }}" ]; then
-            echo "ipa_path=${{ github.event.inputs.artifact_path }}" >> "$GITHUB_OUTPUT"
+            echo "ipa_path=${{ github.event.inputs.artifact_path }}" >> $GITHUB_OUTPUT
             exit 0
           fi
           IPA=$(git ls-files '*.ipa' | head -n1 || true)
           if [ -n "$IPA" ]; then
-            echo "ipa_path=$IPA" >> "$GITHUB_OUTPUT"
+            echo "ipa_path=$IPA" >> $GITHUB_OUTPUT
           else
-            echo "ipa_path=" >> "$GITHUB_OUTPUT"
+            echo "ipa_path=" >> $GITHUB_OUTPUT
           fi
 
   mobsf_static_scan:
@@ -64,7 +64,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Start MobSF Docker (optional admin key)
+      - name: Start MobSF container (optional admin key)
         run: |
           set -euo pipefail
           if [ -n "${MOBSF_ADMIN_KEY:-}" ]; then
@@ -74,7 +74,8 @@ jobs:
           fi
           for i in $(seq 1 30); do
             if curl -sS "http://localhost:${MOBSF_PORT}/" >/dev/null 2>&1; then
-              echo "MobSF reachable"; break
+              echo "MobSF reachable"
+              break
             fi
             sleep 2
           done
@@ -91,7 +92,7 @@ jobs:
           cp "${{ needs.prep.outputs.ipa_path }}" "${{ env.ARTIFACT_DIR }}/target.ipa"
           ls -lah "${{ env.ARTIFACT_DIR }}"
 
-      - name: Upload and scan with MobSF (inline)
+      - name: Upload & scan to MobSF (inline, fails on non-200)
         run: |
           set -euo pipefail
           IPA="${{ env.ARTIFACT_DIR }}/target.ipa"
@@ -103,23 +104,17 @@ jobs:
             UPLOAD_RAW=$(curl -s -w "\n%{http_code}" -F "file=@${IPA}" "${MOBSF_URL}/api/v1/upload")
           fi
           HTTP_STATUS=$(echo "$UPLOAD_RAW" | tail -n1)
-          BODY=$(echo "$UPLOAD_RAW" | sed '$d' || true)
-          echo "$BODY" > "${OUTDIR}/mobsf_upload_response.json"
+          echo "$UPLOAD_RAW" > "${OUTDIR}/mobsf_upload_raw.txt"
+          # extract JSON body (all but last line)
+          echo "$UPLOAD_RAW" | sed '$d' > "${OUTDIR}/mobsf_upload_response.json" || true
           if [ "$HTTP_STATUS" != "200" ] && [ "$HTTP_STATUS" != "201" ]; then
-            echo "MobSF upload failed: status $HTTP_STATUS" >&2
-            echo "See ${OUTDIR}/mobsf_upload_response.json for server response" >&2
+            echo "MobSF upload failed with status $HTTP_STATUS" >&2
+            echo "See ${OUTDIR}/mobsf_upload_response.json" >&2
             docker stop mobsf || true
             exit 1
           fi
-          HASH=$(python3 - <<PY
-import json,sys
-try:
-  j=json.loads(open("${OUTDIR}/mobsf_upload_response.json").read())
-  print(j.get("hash",""))
-except Exception:
-  print("")
-PY
-)
+          # extract "hash" field using grep/sed (portable)
+          HASH=$(grep -o '"hash"[[:space:]]*:[[:space:]]*"[^"]*"' "${OUTDIR}/mobsf_upload_response.json" | head -n1 | sed 's/.*"hash"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
           if [ -z "$HASH" ]; then
             echo "MobSF did not return a hash; aborting" >&2
             docker stop mobsf || true
@@ -132,7 +127,7 @@ PY
           done
           echo "MobSF reports saved to ${OUTDIR}"
 
-      - name: Stop MobSF (always)
+      - name: Stop MobSF
         if: always()
         run: docker stop mobsf || true
 
@@ -151,7 +146,7 @@ PY
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install utilities
+      - name: Install utils
         run: |
           set -euo pipefail
           sudo apt-get update -y
@@ -178,15 +173,7 @@ PY
             echo ".app not found in IPA" >&2
             exit 1
           fi
-          BINNAME=$(python3 - <<PY
-import plistlib,sys
-try:
-  p=plistlib.load(open("$APPDIR/Info.plist","rb"))
-  print(p.get("CFBundleExecutable",""))
-except Exception:
-  print("")
-PY
-)
+          BINNAME=$(python3 -c 'import plistlib,sys; p=plistlib.load(open("'"$APPDIR"'/Info.plist","rb")); print(p.get("CFBundleExecutable",""))' 2>/dev/null || true)
           if [ -z "$BINNAME" ]; then
             BINPATH=$(find "$APPDIR" -maxdepth 1 -type f -printf "%s %p\n" | sort -nr | awk 'NR==1{print $2}')
           else
@@ -196,27 +183,25 @@ PY
             echo "Binary not found at $BINPATH" >&2
             exit 1
           fi
-          # create artifacts
           echo "Binary analysis for: $OUTDIR/target.ipa" > "$OUTDIR/binary-analysis-summary.txt"
           file "$BINPATH" >> "$OUTDIR/binary-analysis-summary.txt" 2>&1 || true
-          file "$BINPATH" | tr -d '\n' > "$OUTDIR/binary-filetype.txt" || true
           strings "$BINPATH" | sed -n '1,1000p' > "$OUTDIR/binary-strings-top.txt" || true
           strings "$BINPATH" | egrep -i "http://|https://|api[_-]?key|apiKey|access[_-]?token|secret|password|BEGIN RSA PRIVATE KEY|AWS|oauth|jwt" | sort -u > "$OUTDIR/binary-suspect-strings.txt" || true
           if command -v nm >/dev/null 2>&1; then
             nm -n "$BINPATH" > "$OUTDIR/binary-nm-head.txt" 2> "$OUTDIR/binary-nm-err.txt" || true
           fi
-          python3 - <<PY > "$OUTDIR/binary-entropy.txt"
+          python3 - <<'PY' > "$OUTDIR/binary-entropy.txt"
 import math,collections,sys
-b=open("$BINPATH","rb").read()
-def entropy(data):
-  if not data:
-    print(0); sys.exit(0)
-  counts=collections.Counter(data)
-  e=0.0
-  for v in counts.values():
-    p=v/len(data)
-    e -= p * math.log(p,2)
-  print(e)
+b=open("'''$BINPATH'''","rb").read()
+if not b:
+  print(0)
+  sys.exit(0)
+counts=collections.Counter(b)
+e=0.0
+for v in counts.values():
+  p=v/len(b)
+  e -= p * math.log(p,2)
+print(e)
 PY
           echo "binary artifacts created in $OUTDIR"
 
@@ -323,9 +308,9 @@ PY
           SWIFT_COUNT=$(git ls-files '*.swift' | wc -l || echo 0)
           HAS_XCODE=$(ls *.xcodeproj 2>/dev/null || ls *.xcworkspace 2>/dev/null || true)
           if [ "$SWIFT_COUNT" -gt 0 ] || [ -n "$HAS_XCODE" ]; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "run=true" >> $GITHUB_OUTPUT
           else
-            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "run=false" >> $GITHUB_OUTPUT
           fi
 
       - name: Initialize CodeQL (only if code present)
@@ -334,7 +319,7 @@ PY
         with:
           languages: 'swift'
 
-      - name: Build for CodeQL & runtime checks on macOS
+      - name: Build for CodeQL & runtime checks (macOS)
         if: ${{ steps.detect_codeql.outputs.run == 'true' }}
         run: |
           set -euo pipefail
