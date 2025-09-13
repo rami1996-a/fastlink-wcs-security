@@ -6,7 +6,7 @@ on:
       artifact_path:
         description: 'Path to IPA in repo (relative). If empty pipeline will attempt to build from Xcode project.'
         required: false
-        default: ''
+        default: 'ios.ipa'
 
 # allow all runs (do not cancel-in-progress)
 concurrency:
