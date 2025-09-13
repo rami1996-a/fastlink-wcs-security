@@ -56,7 +56,6 @@ jobs:
             echo "ipa_path=" >> $GITHUB_OUTPUT
           fi
 
-  # MobSF (Docker) calling your script
   mobsf_static_scan:
     needs: prep
     runs-on: ubuntu-latest
@@ -70,6 +69,8 @@ jobs:
 
       - name: Start MobSF Docker (no API key required)
         run: |
+          # If you later want to set an admin key so the container allows uploads, run:
+          # docker run --rm -d --name mobsf -e "MOBSF_ADMIN_KEY=yourkey" -p ${MOBSF_PORT}:8000 opensecurity/mobile-security-framework-mobsf:latest
           docker run --rm -d --name mobsf -p ${MOBSF_PORT}:8000 opensecurity/mobile-security-framework-mobsf:latest
           for i in $(seq 1 30); do
             if curl -sS "http://localhost:${MOBSF_PORT}/" > /dev/null; then break; fi
@@ -86,7 +87,7 @@ jobs:
           fi
           ls -la ${{ env.ARTIFACT_DIR }}
 
-      - name: Run MobSF scan script (no API key)
+      - name: Run MobSF scan script (no API key) with fallback
         if: ${{ needs.prep.outputs.ipa_path != '' }}
         run: |
           ${SCRIPT_DIR}/mobsf_scan_noapikey.sh "${{ env.ARTIFACT_DIR }}/target.ipa" "http://localhost:${MOBSF_PORT}" "${{ env.ARTIFACT_DIR }}" || true
@@ -102,7 +103,6 @@ jobs:
           path: ${{ env.ARTIFACT_DIR }}/mobsf_*.{json,html,xml,pdf},${{ env.ARTIFACT_DIR }}/mobsf-*.*
           if-no-files-found: ignore
 
-  # Binary static analysis (calls your binary_static_analysis.sh)
   binary_static:
     needs: prep
     runs-on: ubuntu-latest
@@ -117,7 +117,7 @@ jobs:
       - name: Install packages required by script
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y unzip binutils python3-pip
+          sudo apt-get install -y unzip binutils python3-pip file
           pip3 install macholib || true
 
       - name: Copy IPA and run binary static script
@@ -135,11 +135,10 @@ jobs:
           path: ${{ env.ARTIFACT_DIR }}/binary-*,${{ env.ARTIFACT_DIR }}/classdump-headers/**
           if-no-files-found: ignore
 
-  # Dependency scanning using your deps_scan.sh (no CodeQL here)
   deps_and_codeql:
     needs: prep
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -147,7 +146,7 @@ jobs:
       - name: Ensure scripts executable (job-level)
         run: chmod +x ${{ env.SCRIPT_DIR }}/*.sh || true
 
-      - name: Run deps_scan script (OWASP DC)
+      - name: Run deps_scan script (OWASP DC) – robust downloader
         run: |
           mkdir -p ${{ env.ARTIFACT_DIR }}
           ${SCRIPT_DIR}/deps_scan.sh "${{ env.ARTIFACT_DIR }}" || true
@@ -159,7 +158,6 @@ jobs:
           path: ${{ env.ARTIFACT_DIR }}/*.json
           if-no-files-found: ignore
 
-  # Secret scanning via your script
   secret_scan:
     needs: prep
     runs-on: ubuntu-latest
@@ -171,7 +169,7 @@ jobs:
       - name: Ensure scripts executable (job-level)
         run: chmod +x ${{ env.SCRIPT_DIR }}/*.sh || true
 
-      - name: Run secret scan script
+      - name: Run secret scan script (detect-secrets + truffleHog)
         run: |
           mkdir -p ${{ env.ARTIFACT_DIR }}
           ${SCRIPT_DIR}/secret_scan.sh "${{ env.ARTIFACT_DIR }}" || true
@@ -183,11 +181,12 @@ jobs:
           path: ${{ env.ARTIFACT_DIR }}/detect-secrets.json,${{ env.ARTIFACT_DIR }}/trufflehog-local.json
           if-no-files-found: ignore
 
-  # macOS runtime/build job - runs CodeQL for Swift here (macOS-only)
   macos_runtime:
     needs: prep
     runs-on: macos-latest
     timeout-minutes: 90
+    outputs:
+      run_codeql: ${{ steps.detect_codeql.outputs.run }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -195,7 +194,21 @@ jobs:
       - name: Ensure scripts executable (macOS)
         run: chmod +x ${{ env.SCRIPT_DIR }}/*.sh || true
 
-      - name: Initialize CodeQL (Swift) on macOS
+      - name: Detect whether to run CodeQL (Swift/Xcode present)
+        id: detect_codeql
+        run: |
+          set -e
+          # detect Swift files or Xcode project/workspace
+          SWIFT_COUNT=$(git ls-files '*.swift' | wc -l || echo 0)
+          HAS_XCODE=$(ls *.xcodeproj 2>/dev/null || ls *.xcworkspace 2>/dev/null || true)
+          if [ "$SWIFT_COUNT" -gt 0 ] || [ -n "$HAS_XCODE" ]; then
+            echo "run=true" >> $GITHUB_OUTPUT
+          else
+            echo "run=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Initialize CodeQL (Swift) on macOS (only if code present)
+        if: ${{ steps.detect_codeql.outputs.run == 'true' }}
         uses: github/codeql-action/init@v2
         with:
           languages: 'swift'
@@ -225,7 +238,8 @@ jobs:
         run: |
           echo "Note: runtime instrumentation (Frida) is limited in CI; for deeper runtime tests use a device or self-hosted macOS runner."
 
-      - name: Run CodeQL analyze (Swift)
+      - name: Run CodeQL analyze (Swift) — only if code present
+        if: ${{ steps.detect_codeql.outputs.run == 'true' }}
         uses: github/codeql-action/analyze@v2
         with:
           category: 'security'
@@ -237,7 +251,6 @@ jobs:
           path: ${{ env.ARTIFACT_DIR }}
           if-no-files-found: ignore
 
-  # Consolidate everything
   collect_reports:
     needs: [mobsf_static_scan, binary_static, deps_and_codeql, secret_scan, macos_runtime]
     runs-on: ubuntu-latest
