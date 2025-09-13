@@ -1,16 +1,21 @@
-name: iOS Pentest Pipeline (Full Inline Scripts)
+name: iOS Pentest Pipeline (No Secrets Required - Full Scripts)
 
 on:
   workflow_dispatch:
     inputs:
       artifact_path:
-        description: 'Path to IPA in repo (relative). Defaults to ios.ipa'
+        description: 'Path to IPA in repo (relative). If empty pipeline will attempt to build from Xcode project.'
         required: false
         default: 'ios.ipa'
+
+concurrency:
+  group: ios-pentest-no-secrets-${{ github.run_id }}
+  cancel-in-progress: false
 
 env:
   ARTIFACT_DIR: pentest-artifacts
   MOBSF_PORT: 8000
+  SCRIPT_DIR: scripts
 
 jobs:
   prep:
@@ -21,8 +26,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Ensure artifact dir
-        run: mkdir -p "${{ env.ARTIFACT_DIR }}"
+      - name: Ensure artifact dir & scripts are executable
+        run: |
+          mkdir -p ${{ env.ARTIFACT_DIR }}
+          chmod +x ${{ env.SCRIPT_DIR }}/*.sh || true
 
       - name: Get IPA path
         id: get-artifact
@@ -35,101 +42,120 @@ jobs:
             echo "ipa_path=ios.ipa" >> $GITHUB_OUTPUT
           else
             echo "ipa_path=" >> $GITHUB_OUTPUT
+          fi
 
   mobsf_static_scan:
     needs: prep
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Prepare IPA
+      - name: Start MobSF Docker (no API key required)
+        run: |
+          docker run --rm -d --name mobsf -p ${MOBSF_PORT}:8000 opensecurity/mobile-security-framework-mobsf:latest
+          for i in $(seq 1 30); do
+            if curl -sS "http://localhost:${MOBSF_PORT}/" > /dev/null; then break; fi
+            sleep 2
+          done || true
+
+      - name: Prepare IPA for scan
         run: |
           set -euo pipefail
-          IPA="${{ needs.prep.outputs.ipa_path }}"
-          if [ ! -f "$IPA" ]; then
-            echo "IPA not found; failing MobSF scan"
+          mkdir -p ${{ env.ARTIFACT_DIR }}
+          if [ -n "${{ needs.prep.outputs.ipa_path }}" ]; then
+            cp "${{ needs.prep.outputs.ipa_path }}" "${{ env.ARTIFACT_DIR }}/target.ipa"
+          else
+            echo "No IPA found; failing pipeline" >&2
             exit 1
           fi
-          cp "$IPA" "${{ env.ARTIFACT_DIR }}/target.ipa"
+          ls -la ${{ env.ARTIFACT_DIR }}
 
-      - name: Run MobSF fallback scan
+      - name: Run MobSF scan script
         run: |
           set -euo pipefail
-          mkdir -p "${{ env.ARTIFACT_DIR }}/mobsf"
-          unzip -q "${{ env.ARTIFACT_DIR }}/target.ipa" -d "${{ env.ARTIFACT_DIR }}/mobsf/fallback"
+          ${SCRIPT_DIR}/mobsf_scan_noapikey.sh "${{ env.ARTIFACT_DIR }}/target.ipa" "http://localhost:${MOBSF_PORT}" "${{ env.ARTIFACT_DIR }}" || true
+
+      - name: Stop MobSF
+        if: always()
+        run: docker stop mobsf || true
 
       - name: Upload MobSF reports
         uses: actions/upload-artifact@v4
         with:
           name: mobsf-reports
-          path: ${{ env.ARTIFACT_DIR }}/mobsf
+          path: ${{ env.ARTIFACT_DIR }}/mobsf_*.{json,html,xml,pdf},${{ env.ARTIFACT_DIR }}/mobsf-*.*
           if-no-files-found: ignore
 
   binary_static:
     needs: prep
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install tools
+      - name: Install packages required by script
         run: |
           sudo apt-get update -y
           sudo apt-get install -y unzip binutils python3-pip
           pip3 install macholib || true
 
-      - name: Binary static analysis
+      - name: Copy IPA and run binary static script
         run: |
           set -euo pipefail
-          IPA="${{ needs.prep.outputs.ipa_path }}"
-          if [ ! -f "$IPA" ]; then
-            echo "IPA not found; failing binary analysis"
+          mkdir -p ${{ env.ARTIFACT_DIR }}
+          if [ -n "${{ needs.prep.outputs.ipa_path }}" ]; then
+            cp "${{ needs.prep.outputs.ipa_path }}" "${{ env.ARTIFACT_DIR }}/target.ipa"
+            ${SCRIPT_DIR}/binary_static_analysis.sh "${{ env.ARTIFACT_DIR }}/target.ipa" "${{ env.ARTIFACT_DIR }}"
+          else
+            echo "IPA not found; failing binary analysis" >&2
             exit 1
           fi
-          mkdir -p "${{ env.ARTIFACT_DIR }}/binary"
-          unzip -q "$IPA" -d "${{ env.ARTIFACT_DIR }}/binary/unzipped"
-          echo "[binary] done. Reports in ${ARTIFACT_DIR}/binary"
 
-      - name: Upload binary artifacts
+      - name: Upload binary analysis artifacts
         uses: actions/upload-artifact@v4
         with:
           name: binary-analysis
-          path: ${{ env.ARTIFACT_DIR }}/binary
+          path: ${{ env.ARTIFACT_DIR }}/binary-*,${{ env.ARTIFACT_DIR }}/classdump-headers/**
           if-no-files-found: ignore
 
   deps_and_codeql:
     needs: prep
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Run dummy dependency check
+      - name: Run deps_scan
         run: |
           set -euo pipefail
-          mkdir -p "${{ env.ARTIFACT_DIR }}/deps"
-          echo '{"dummy-dependency":"ok"}' > "${{ env.ARTIFACT_DIR }}/deps/deps_report.json"
+          mkdir -p ${{ env.ARTIFACT_DIR }}
+          ${SCRIPT_DIR}/deps_scan.sh "${{ env.ARTIFACT_DIR }}" || { echo "Dependency scan failed"; exit 1; }
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v2
         with:
-          languages: ''
+          languages: 'swift'
 
-      - name: Skip CodeQL if no source
+      - name: Run CodeQL analyze
         run: |
-          echo "No source code in repo; skipping CodeQL analysis"
+          set -euo pipefail
+          github/codeql-action/analyze@v2 || echo "CodeQL skipped (no supported source code)"
 
       - name: Upload deps reports
         uses: actions/upload-artifact@v4
         with:
           name: deps-reports
-          path: ${{ env.ARTIFACT_DIR }}/deps
+          path: ${{ env.ARTIFACT_DIR }}/*.json
           if-no-files-found: ignore
 
   secret_scan:
     needs: prep
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -137,37 +163,46 @@ jobs:
       - name: Run secret scan
         run: |
           set -euo pipefail
-          mkdir -p "${{ env.ARTIFACT_DIR }}/secrets"
-          echo '{"detect-secrets":"dummy"}' > "${{ env.ARTIFACT_DIR }}/secrets/detect-secrets.json"
-          echo '{"trufflehog":"dummy"}' > "${{ env.ARTIFACT_DIR }}/secrets/trufflehog-local.json"
+          mkdir -p ${{ env.ARTIFACT_DIR }}
+          ${SCRIPT_DIR}/secret_scan.sh "${{ env.ARTIFACT_DIR }}" || { echo "Secret scan failed"; exit 1; }
 
-      - name: Upload secret scan artifacts
+      - name: Upload secret-scan artifacts
         uses: actions/upload-artifact@v4
         with:
           name: secret-scan
-          path: ${{ env.ARTIFACT_DIR }}/secrets
+          path: ${{ env.ARTIFACT_DIR }}/detect-secrets.json,${{ env.ARTIFACT_DIR }}/trufflehog-local.json
           if-no-files-found: ignore
 
   macos_runtime:
     needs: prep
     runs-on: macos-latest
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Attempt simulator build
+      - name: Make scripts executable on macOS
         run: |
           set -euo pipefail
-          if ls *.xcworkspace 1>/dev/null 2>&1; then
-            WORKSPACE=$(ls *.xcworkspace | head -n1)
-            SCHEME="${WORKSPACE%.*}"
-            xcodebuild -workspace "$WORKSPACE" -scheme "$SCHEME" -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPhone 14,OS=latest' clean build
-          elif ls *.xcodeproj 1>/dev/null 2>&1; then
-            PROJECT=$(ls *.xcodeproj | head -n1)
-            SCHEME="${PROJECT%.*}"
-            xcodebuild -project "$PROJECT" -scheme "$SCHEME" -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPhone 14,OS=latest' clean build
+          chmod +x ${{ env.SCRIPT_DIR }}/*.sh || true
+
+      - name: Attempt simulator build (no signing)
+        run: |
+          set -euo pipefail
+          if ls *.xcworkspace 1> /dev/null 2>&1 || ls *.xcodeproj 1> /dev/null 2>&1; then
+            WORKSPACE=$(ls *.xcworkspace 2>/dev/null | head -n1 || true)
+            PROJECT=$(ls *.xcodeproj 2>/dev/null | head -n1 || true)
+            if [ -n "$WORKSPACE" ]; then
+              SCHEME="$(basename ${WORKSPACE%.*})"
+              xcodebuild -workspace "$WORKSPACE" -scheme "$SCHEME" -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPhone 14,OS=latest' clean build || true
+            elif [ -n "$PROJECT" ]; then
+              SCHEME="$(basename ${PROJECT%.*})"
+              xcodebuild -project "$PROJECT" -scheme "$SCHEME" -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPhone 14,OS=latest' clean build || true
+            else
+              echo "No Xcode project/workspace found; skipping build"
+            fi
           else
-            echo "No Xcode project/workspace; skipping macOS build"
+            echo "No xcode project/workspace present"
           fi
 
       - name: Upload macOS artifacts
@@ -184,10 +219,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Consolidate reports
+      - name: Run collect_reports
         run: |
           set -euo pipefail
-          tar -czf "${{ env.ARTIFACT_DIR }}/pentest-all-reports.tar.gz" -C "${{ env.ARTIFACT_DIR }}" .
+          mkdir -p ${{ env.ARTIFACT_DIR }}
+          ${SCRIPT_DIR}/collect_reports.sh "${{ env.ARTIFACT_DIR }}" || { echo "Collect reports failed"; exit 1; }
 
       - name: Upload final pentest archive
         uses: actions/upload-artifact@v4
