@@ -1,206 +1,248 @@
-name: APK Security Pipeline
+name: iOS Pentest Pipeline (No Secrets Required)
 
 on:
-  push:
-    branches: [ "main" ]
   workflow_dispatch:
+    inputs:
+      artifact_path:
+        description: 'Path to IPA in repo (relative). If empty pipeline will attempt to build from Xcode project.'
+        required: false
+        default: ''
+
+concurrency:
+  group: ios-pentest-no-secrets
+  cancel-in-progress: true
+
+env:
+  ARTIFACT_DIR: pentest-artifacts
+  MOBSF_PORT: 8000
 
 jobs:
-  apk-security:
+  prep:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
-
+    outputs:
+      ipa_path: ${{ steps.get-artifact.outputs.ipa_path }}
     steps:
-    - name: Checkout repository (with LFS)
-      uses: actions/checkout@v4
-      with:
-        lfs: true
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    - name: Setup Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.10'
+      - name: Ensure artifact dir
+        run: mkdir -p ${{ env.ARTIFACT_DIR }}
 
-    - name: Create working dirs
-      run: |
-        mkdir -p reports
-        mkdir -p app_decompiled
-        mkdir -p vpn
-        mkdir -p tools
-
-    - name: Install system dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y unzip default-jdk android-tools-adb wget curl jq apktool ca-certificates git unzip zip
-
-    - name: Install Python & CLI tools (MobSF, frida-tools, objection)
-      run: |
-        python -m pip install --upgrade pip
-        pip install mobsfscan frida-tools objection || true
-
-        # Install gitleaks binary
-        GITLEAKS_VER="v8.19.1"
-        wget -q "https://github.com/zricethezav/gitleaks/releases/download/${GITLEAKS_VER}/gitleaks_${GITLEAKS_VER#v}_linux_x64.tar.gz" -O /tmp/gitleaks.tar.gz || true
-        tar -xzf /tmp/gitleaks.tar.gz -C /tmp || true
-        sudo mv /tmp/gitleaks /usr/local/bin/ || true
-        gitleaks version || true
-
-        # Install Syft (Anchore)
-        curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sudo sh -s -- -b /usr/local/bin || true
-        syft --version || true
-
-        # Install Trivy (Aqua)
-        curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin || true
-        trivy --version || true
-
-    - name: Verify repo-provided tools (frida-server, agents etc.)
-      run: |
-        echo "tools/ content (optional binaries expected here):"
-        ls -la tools || true
-        if [ ! -f "tools/frida-server-android-x86_64" ]; then
-          echo "[!] frida-server-android-x86_64 missing under tools/ (optional)."
-        fi
-        if [ ! -f "tools/drozer-agent.apk" ]; then
-          echo "[!] drozer-agent.apk missing under tools/ (we recommend using Frida/Objection instead)."
-        fi
-
-    - name: Install OpenFortiVPN client
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y openfortivpn
-
-    - name: Connect to Fortinet VPN
-      env:
-        VPN_EMAIL: ${{ secrets.VPN_EMAIL }}
-        VPN_PASSWORD: ${{ secrets.VPN_PASSWORD }}
-      run: |
-        # Exit if VPN secrets are missing
-        if [ -z "$VPN_EMAIL" ] || [ -z "$VPN_PASSWORD" ]; then
-          echo "[!] VPN secrets not provided - skipping VPN connection."
-          exit 0
-        fi
-
-        # Ensure reports folder exists
-        mkdir -p reports
-
-        # Write config with proper variable expansion
-        cat <<EOF | sudo tee /etc/openfortivpn/config > /dev/null
-        host = znkfw.newroztelecom.com
-        port = 10443
-        username = ${VPN_EMAIL}
-        password = ${VPN_PASSWORD}
-        set-dns = 1
-        set-routes = 1
-        trusted-cert = d1766a4f0c0634b642d3d0e8dafc4b8f1258ed9dce9ee725ee19db9ce46fd233
-        EOF
-
-        echo "[+] Connecting to VPN..."
-        sudo openfortivpn -c /etc/openfortivpn/config > reports/openforti.log 2>&1 &
-        PID=$!
-
-        # Wait for VPN to establish
-        TIMEOUT=30
-        INTERVAL=2
-        waited=0
-        while [ $waited -lt $TIMEOUT ]; do
-          if grep -qi "connected" reports/openforti.log >/dev/null 2>&1; then
-            echo "[+] VPN connected successfully"
-            break
+      - name: Get IPA input (workflow input) or find in repo
+        id: get-artifact
+        run: |
+          if [ -n "${{ github.event.inputs.artifact_path }}" ]; then
+            echo "ipa_path=${{ github.event.inputs.artifact_path }}" >> $GITHUB_OUTPUT
+            exit 0
           fi
-          if ! kill -0 "$PID" >/dev/null 2>&1; then
-            echo "[!] openfortivpn process exited unexpectedly. Dumping log:"
-            tail -n 50 reports/openforti.log
-            exit 1
+          IPA=$(git ls-files '*.ipa' | head -n1 || true)
+          if [ -n "$IPA" ]; then
+            echo "ipa_path=$IPA" >> $GITHUB_OUTPUT
+          else
+            echo "ipa_path=" >> $GITHUB_OUTPUT
           fi
-          sleep $INTERVAL
-          waited=$((waited + INTERVAL))
-        done
+        
+       
+      
+     
 
-        if [ $waited -ge $TIMEOUT ]; then
-          echo "[!] VPN did not establish within ${TIMEOUT}s. Tail of log:"
-          tail -n 50 reports/openforti.log
-          sudo kill "$PID" || true
-          exit 1
-        fi
+  mobsf_static_scan:
+    needs: prep
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-        # Optional internal API test (does NOT fail workflow)
-        echo "[*] Testing internal API (may fail on GitHub runners)"
-        if ! curl -I https://internal-api.company.local >/dev/null 2>&1; then
-          echo "[!] Internal API unreachable — likely expected on CI."
-        else
-          echo "[+] Internal API reachable"
-        fi
-      shell: /usr/bin/bash -e {0}
+      - name: Start MobSF Docker (no API key required)
+        run: |
+          docker run --rm -d --name mobsf -p ${MOBSF_PORT}:8000 opensecurity/mobile-security-framework-mobsf:latest
+          for i in $(seq 1 30); do
+            if curl -sS "http://localhost:${MOBSF_PORT}/" > /dev/null; then break; fi
+            sleep 2
+          done
+          curl -sS "http://localhost:${MOBSF_PORT}/" || true
 
+      - name: Prepare IPA for scan
+        run: |
+          mkdir -p ${{ env.ARTIFACT_DIR }}
+          if [ -n "${{ needs.prep.outputs.ipa_path }}" ]; then
+            cp "${{ needs.prep.outputs.ipa_path }}" "${{ env.ARTIFACT_DIR }}/target.ipa" || true
+          else
+            echo "No IPA provided; skipping MobSF upload (you can enable macos build job to create an ipa)." > ${{ env.ARTIFACT_DIR }}/mobsf-skip.txt
+          fi
+          ls -la ${{ env.ARTIFACT_DIR }}
 
-    - name: Decompile APK (skip if existing)
-      run: |
-        if [ -d "app_decompiled" ] && [ "$(ls -A app_decompiled)" ]; then
-          echo "[+] app_decompiled exists and is not empty — skipping decompile."
-          ls -la app_decompiled | sed -n '1,200p'
-        else
-          echo "[+] Decompiling app.apk -> app_decompiled"
-          apktool d app.apk -o app_decompiled || true
-          echo "[+] Decompile done:"
-          ls -la app_decompiled | sed -n '1,200p'
-        fi
+      - name: Upload and scan with MobSF (no API key)
+        if: ${{ needs.prep.outputs.ipa_path != '' }}
+        run: |
+          chmod +x scripts/mobsf_scan_noapikey.sh
+          scripts/mobsf_scan_noapikey.sh "${{ env.ARTIFACT_DIR }}/target.ipa" "http://localhost:${MOBSF_PORT}" "${{ env.ARTIFACT_DIR }}"
 
-    - name: Run MobSF static scan
-      run: |
-        mkdir -p reports
-        mobsfscan app_decompiled/AndroidManifest.xml --json > reports/mobsfscan.json || true
+      - name: Stop MobSF
+        if: always()
+        run: docker stop mobsf || true
 
-    - name: Run Gitleaks (secrets) on decompiled files
-      run: |
-        mkdir -p reports
-        gitleaks detect --source app_decompiled --report-path reports/gitleaks.json || true
+      - name: Upload MobSF reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: mobsf-reports
+          path: ${{ env.ARTIFACT_DIR }}/mobsf_*.{json,html,xml},${{ env.ARTIFACT_DIR }}/mobsf-*.*
+          if-no-files-found: ignore
 
-    - name: Generate SBOM from APK (Syft)
-      run: |
-        syft app.apk -o spdx-json > app_decompiled/sbom.json || true
-        echo "SBOM packages count:"; jq '.packages | length' app_decompiled/sbom.json || true
-        jq '(.packages[]? | {purl: .purl, name: .name, version: .version})' app_decompiled/sbom.json > reports/sbom_packages.json || true
+  binary_static:
+    needs: prep
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    - name: Trivy quick scan (APK)
-      run: |
-        mkdir -p reports
-        trivy fs --format json --output reports/trivy_apk.json app.apk || true
+      - name: Install basic tools
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y unzip binutils python3-pip openjdk-11-jre-headless
+          pip3 install macholib
 
-    - name: Run OWASP Dependency-Check
-      run: |
-        mkdir -p reports/dependency-check
-        docker run --rm \
-          -v "${{ github.workspace }}":/src \
-          -v "${{ github.workspace }}/reports/dependency-check":/report \
-          owasp/dependency-check:8.5.3 \
-          --project "fastlink-wsc" \
-          --scan /src \
-          --out /report \
-          --format ALL || true
+      - name: Copy IPA and run binary static analysis
+        run: |
+          mkdir -p ${{ env.ARTIFACT_DIR }}
+          if [ -n "${{ needs.prep.outputs.ipa_path }}" ]; then
+            cp "${{ needs.prep.outputs.ipa_path }}" "${{ env.ARTIFACT_DIR }}/target.ipa" || true
+          fi
+          chmod +x scripts/binary_static_analysis.sh
+          scripts/binary_static_analysis.sh "${{ env.ARTIFACT_DIR }}/target.ipa" "${{ env.ARTIFACT_DIR }}"
 
+      - name: Upload binary analysis artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-analysis
+          path: ${{ env.ARTIFACT_DIR }}/binary-*.txt
+          if-no-files-found: ignore
 
+  deps_and_codeql:
+    needs: prep
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    - name: Launch Android Emulator & Run Dynamic Scan
-      uses: reactivecircus/android-emulator-runner@v2
-      with:
-        api-level: 30
-        target: default
-        arch: x86_64
-        profile: Nexus 6
-        script: |
-          chmod +x ./scripts/dynamic_scan.sh
-          ./scripts/dynamic_scan.sh
+      - name: Install OWASP Dependency-Check (CLI)
+        run: |
+          wget https://github.com/jeremylong/DependencyCheck/releases/download/v8.0.2/dependency-check-8.0.2-release.zip -O /tmp/dc.zip
+          unzip -q /tmp/dc.zip -d /tmp/dc || true
+          chmod +x /tmp/dc/bin/dependency-check.sh
 
-    - name: Upload Security Reports
-      uses: actions/upload-artifact@v4
-      with:
-        name: security-reports
-        path: |
-          reports/**
-          app_decompiled/**
+      - name: Run dependency-check on repo (CocoaPods/Swift)
+        run: |
+          mkdir -p ${{ env.ARTIFACT_DIR }}
+          # If podfile.lock exists, point dc at it; otherwise scan whole repo
+          if [ -f Podfile.lock ]; then
+            /tmp/dc/bin/dependency-check.sh --project "iOS-Deps" --scan Podfile.lock --format JSON --out ${{ env.ARTIFACT_DIR }} || true
+          else
+            /tmp/dc/bin/dependency-check.sh --project "iOS-Repo" --scan . --format JSON --out ${{ env.ARTIFACT_DIR }} || true
+          fi
 
-    - name: Stop VPN (best-effort)
-      if: ${{ always() }}
-      run: |
-        sudo pkill openfortivpn || true
-        echo "[+] VPN stopped (if it was running)"
+      - name: Run CodeQL (Swift)
+        uses: github/codeql-action/init@v2
+        with:
+          languages: 'swift'
+      - name: Autobuild (CodeQL)
+        uses: github/codeql-action/autobuild@v2
+      - name: Run CodeQL analyze
+        uses: github/codeql-action/analyze@v2
+        with:
+          category: 'security'
+
+      - name: Upload deps reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: deps-reports
+          path: ${{ env.ARTIFACT_DIR }}/*.json
+          if-no-files-found: ignore
+
+  secret_scan:
+    needs: prep
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install detect-secrets & truffleHog (local)
+        run: |
+          pip3 install detect-secrets truffleHog
+
+      - name: Run detect-secrets baseline and scan
+        run: |
+          mkdir -p ${{ env.ARTIFACT_DIR }}
+          detect-secrets scan > ${{ env.ARTIFACT_DIR }}/detect-secrets.json || true
+
+      - name: Run truffleHog (local filesystem scan)
+        run: |
+          trufflehog filesystem --json . > ${{ env.ARTIFACT_DIR }}/trufflehog-local.json || true
+
+      - name: Upload secret scan artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: secret-scan
+          path: ${{ env.ARTIFACT_DIR }}/detect-secrets.json,${{ env.ARTIFACT_DIR }}/trufflehog-local.json
+          if-no-files-found: ignore
+
+  macos_runtime:
+    needs: prep
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install CocoaPods (if needed)
+        run: |
+          brew update || true
+          brew install cocoapods || true
+
+      - name: Try to build for iOS simulator (no signing)
+        run: |
+          # Attempt to build an example scheme if present. Replace your workspace/scheme if required.
+          if ls *.xcworkspace 1> /dev/null 2>&1 || ls *.xcodeproj 1> /dev/null 2>&1; then
+            # Find workspace or project automatically (best effort)
+            WORKSPACE=$(ls *.xcworkspace 2>/dev/null | head -n1 || true)
+            PROJECT=$(ls *.xcodeproj 2>/dev/null | head -n1 || true)
+            if [ -n "$WORKSPACE" ]; then
+              echo "Found workspace: $WORKSPACE"
+              xcodebuild -workspace "$WORKSPACE" -scheme "$(basename ${WORKSPACE%.*})" -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPhone 14,OS=latest' clean build || true
+            elif [ -n "$PROJECT" ]; then
+              echo "Found project: $PROJECT"
+              xcodebuild -project "$PROJECT" -scheme "$(basename ${PROJECT%.*})" -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPhone 14,OS=latest' clean build || true
+            else
+              echo "No Xcode project/workspace found; skipping build"
+            fi
+          else
+            echo "No xcode project/workspace present"
+          fi
+
+      - name: Upload macos artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-reports
+          path: ${{ env.ARTIFACT_DIR }}
+          if-no-files-found: ignore
+
+  collect_reports:
+    needs: [mobsf_static_scan, binary_static, deps_and_codeql, secret_scan, macos_runtime]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Collect artifacts into final archive
+        run: |
+          mkdir -p ${{ env.ARTIFACT_DIR }}/final
+          cp -r ${{ env.ARTIFACT_DIR }}/* ${{ env.ARTIFACT_DIR }}/final/ || true
+          tar -czf ${{ env.ARTIFACT_DIR }}/pentest-all-reports.tar.gz -C ${{ env.ARTIFACT_DIR }} final || true
+
+      - name: Upload final report
+        uses: actions/upload-artifact@v4
+        with:
+          name: pentest-all-reports
+          path: ${{ env.ARTIFACT_DIR }}/pentest-all-reports.tar.gz
+          if-no-files-found: ignore
+
