@@ -18,7 +18,6 @@ on:
     branches:
       - main
 
-# allow all runs (do not cancel-in-progress)
 concurrency:
   group: ios-pentest-no-secrets-${{ github.run_id }}
   cancel-in-progress: false
@@ -65,32 +64,30 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Ensure scripts executable (job-level)
-        run: chmod +x ${{ env.SCRIPT_DIR }}/*.sh || true
+        run: chmod +x ${{ env.SCRIPT_DIR }}/*.sh
 
       - name: Start MobSF Docker (no API key required)
         run: |
-          # If you later want to set an admin key so the container allows uploads, run:
-          # docker run --rm -d --name mobsf -e "MOBSF_ADMIN_KEY=yourkey" -p ${MOBSF_PORT}:8000 opensecurity/mobile-security-framework-mobsf:latest
           docker run --rm -d --name mobsf -p ${MOBSF_PORT}:8000 opensecurity/mobile-security-framework-mobsf:latest
           for i in $(seq 1 30); do
             if curl -sS "http://localhost:${MOBSF_PORT}/" > /dev/null; then break; fi
             sleep 2
-          done || true
+          done
 
       - name: Prepare IPA for scan
         run: |
           mkdir -p ${{ env.ARTIFACT_DIR }}
           if [ -n "${{ needs.prep.outputs.ipa_path }}" ]; then
-            cp "${{ needs.prep.outputs.ipa_path }}" "${{ env.ARTIFACT_DIR }}/target.ipa" || true
+            cp "${{ needs.prep.outputs.ipa_path }}" "${{ env.ARTIFACT_DIR }}/target.ipa"
           else
-            echo "No IPA provided; skipping MobSF upload." > ${{ env.ARTIFACT_DIR }}/mobsf-skip.txt
+            echo "No IPA provided; aborting MobSF scan." > ${{ env.ARTIFACT_DIR }}/mobsf-skip.txt
+            exit 1
           fi
           ls -la ${{ env.ARTIFACT_DIR }}
 
-      - name: Run MobSF scan script (no API key) with fallback
-        if: ${{ needs.prep.outputs.ipa_path != '' }}
+      - name: Run MobSF scan script (no API key) — REQUIRED
         run: |
-          ${SCRIPT_DIR}/mobsf_scan_noapikey.sh "${{ env.ARTIFACT_DIR }}/target.ipa" "http://localhost:${MOBSF_PORT}" "${{ env.ARTIFACT_DIR }}" || true
+          ${SCRIPT_DIR}/mobsf_scan_noapikey.sh "${{ env.ARTIFACT_DIR }}/target.ipa" "http://localhost:${MOBSF_PORT}" "${{ env.ARTIFACT_DIR }}"
 
       - name: Stop MobSF
         if: always()
@@ -100,8 +97,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: mobsf-reports
-          path: ${{ env.ARTIFACT_DIR }}/mobsf_*.{json,html,xml,pdf},${{ env.ARTIFACT_DIR }}/mobsf-*.*
-          if-no-files-found: ignore
+          path: ${{ env.ARTIFACT_DIR }}/mobsf_report.*,${{ env.ARTIFACT_DIR }}/mobsf_*.*
+          if-no-files-found: fail
 
   binary_static:
     needs: prep
@@ -112,7 +109,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Ensure scripts executable (job-level)
-        run: chmod +x ${{ env.SCRIPT_DIR }}/*.sh || true
+        run: chmod +x ${{ env.SCRIPT_DIR }}/*.sh
 
       - name: Install packages required by script
         run: |
@@ -120,20 +117,23 @@ jobs:
           sudo apt-get install -y unzip binutils python3-pip file
           pip3 install macholib || true
 
-      - name: Copy IPA and run binary static script
+      - name: Copy IPA and run binary static script — REQUIRED
         run: |
           mkdir -p ${{ env.ARTIFACT_DIR }}
           if [ -n "${{ needs.prep.outputs.ipa_path }}" ]; then
-            cp "${{ needs.prep.outputs.ipa_path }}" "${{ env.ARTIFACT_DIR }}/target.ipa" || true
+            cp "${{ needs.prep.outputs.ipa_path }}" "${{ env.ARTIFACT_DIR }}/target.ipa"
+          else
+            echo "No IPA present; binary static analysis requires an IPA" >&2
+            exit 1
           fi
-          ${SCRIPT_DIR}/binary_static_analysis.sh "${{ env.ARTIFACT_DIR }}/target.ipa" "${{ env.ARTIFACT_DIR }}" || true
+          ${SCRIPT_DIR}/binary_static_analysis.sh "${{ env.ARTIFACT_DIR }}/target.ipa" "${{ env.ARTIFACT_DIR }}"
 
       - name: Upload binary analysis artifacts
         uses: actions/upload-artifact@v4
         with:
           name: binary-analysis
           path: ${{ env.ARTIFACT_DIR }}/binary-*,${{ env.ARTIFACT_DIR }}/classdump-headers/**
-          if-no-files-found: ignore
+          if-no-files-found: fail
 
   deps_and_codeql:
     needs: prep
@@ -144,19 +144,19 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Ensure scripts executable (job-level)
-        run: chmod +x ${{ env.SCRIPT_DIR }}/*.sh || true
+        run: chmod +x ${{ env.SCRIPT_DIR }}/*.sh
 
-      - name: Run deps_scan script (OWASP DC) – robust downloader
+      - name: Run deps_scan script (OWASP DC) — REQUIRED
         run: |
           mkdir -p ${{ env.ARTIFACT_DIR }}
-          ${SCRIPT_DIR}/deps_scan.sh "${{ env.ARTIFACT_DIR }}" || true
+          ${SCRIPT_DIR}/deps_scan.sh "${{ env.ARTIFACT_DIR }}"
 
       - name: Upload dependency-check artifacts
         uses: actions/upload-artifact@v4
         with:
           name: deps-reports
           path: ${{ env.ARTIFACT_DIR }}/*.json
-          if-no-files-found: ignore
+          if-no-files-found: fail
 
   secret_scan:
     needs: prep
@@ -167,38 +167,35 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Ensure scripts executable (job-level)
-        run: chmod +x ${{ env.SCRIPT_DIR }}/*.sh || true
+        run: chmod +x ${{ env.SCRIPT_DIR }}/*.sh
 
-      - name: Run secret scan script (detect-secrets + truffleHog)
+      - name: Run secret scan script (detect-secrets + truffleHog) — REQUIRED
         run: |
           mkdir -p ${{ env.ARTIFACT_DIR }}
-          ${SCRIPT_DIR}/secret_scan.sh "${{ env.ARTIFACT_DIR }}" || true
+          ${SCRIPT_DIR}/secret_scan.sh "${{ env.ARTIFACT_DIR }}"
 
       - name: Upload secret-scan artifacts
         uses: actions/upload-artifact@v4
         with:
           name: secret-scan
           path: ${{ env.ARTIFACT_DIR }}/detect-secrets.json,${{ env.ARTIFACT_DIR }}/trufflehog-local.json
-          if-no-files-found: ignore
+          if-no-files-found: fail
 
   macos_runtime:
     needs: prep
     runs-on: macos-latest
     timeout-minutes: 90
-    outputs:
-      run_codeql: ${{ steps.detect_codeql.outputs.run }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Ensure scripts executable (macOS)
-        run: chmod +x ${{ env.SCRIPT_DIR }}/*.sh || true
+        run: chmod +x ${{ env.SCRIPT_DIR }}/*.sh
 
       - name: Detect whether to run CodeQL (Swift/Xcode present)
         id: detect_codeql
         run: |
           set -e
-          # detect Swift files or Xcode project/workspace
           SWIFT_COUNT=$(git ls-files '*.swift' | wc -l || echo 0)
           HAS_XCODE=$(ls *.xcodeproj 2>/dev/null || ls *.xcworkspace 2>/dev/null || true)
           if [ "$SWIFT_COUNT" -gt 0 ] || [ -n "$HAS_XCODE" ]; then
@@ -221,22 +218,12 @@ jobs:
             PROJECT=$(ls *.xcodeproj 2>/dev/null | head -n1 || true)
             if [ -n "$WORKSPACE" ]; then
               SCHEME="$(basename ${WORKSPACE%.*})"
-              echo "Building workspace: $WORKSPACE ; scheme: $SCHEME"
               xcodebuild -workspace "$WORKSPACE" -scheme "$SCHEME" -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPhone 14,OS=latest' clean build || true
             elif [ -n "$PROJECT" ]; then
               SCHEME="$(basename ${PROJECT%.*})"
-              echo "Building project: $PROJECT ; scheme: $SCHEME"
               xcodebuild -project "$PROJECT" -scheme "$SCHEME" -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPhone 14,OS=latest' clean build || true
-            else
-              echo "No Xcode project/workspace found; skipping build"
             fi
-          else
-            echo "No xcode project/workspace present"
           fi
-
-      - name: (Optional) Runtime checks + Frida notes
-        run: |
-          echo "Note: runtime instrumentation (Frida) is limited in CI; for deeper runtime tests use a device or self-hosted macOS runner."
 
       - name: Run CodeQL analyze (Swift) — only if code present
         if: ${{ steps.detect_codeql.outputs.run == 'true' }}
@@ -259,16 +246,16 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Ensure scripts executable (job-level)
-        run: chmod +x ${{ env.SCRIPT_DIR }}/*.sh || true
+        run: chmod +x ${{ env.SCRIPT_DIR }}/*.sh
 
       - name: Run collect_reports.sh to create final archive
         run: |
           mkdir -p ${{ env.ARTIFACT_DIR }}
-          ${SCRIPT_DIR}/collect_reports.sh "${{ env.ARTIFACT_DIR }}" || true
+          ${SCRIPT_DIR}/collect_reports.sh "${{ env.ARTIFACT_DIR }}"
 
       - name: Upload final pentest archive
         uses: actions/upload-artifact@v4
         with:
           name: pentest-all-reports
           path: ${{ env.ARTIFACT_DIR }}/pentest-all-reports.tar.gz
-          if-no-files-found: ignore
+          if-no-files-found: fail
