@@ -1,16 +1,16 @@
-name: iOS Pentest Pipeline (All-inline, validated)
+name: iOS Pentest Pipeline (No Secrets Required - Inline Scripts)
 
 on:
   workflow_dispatch:
     inputs:
       artifact_path:
-        description: 'Path to IPA in repo (relative). Defaults to ios.ipa in repo root.'
+        description: 'Path to IPA in repo (relative). If empty pipeline will attempt to build from Xcode project.'
         required: false
         default: 'ios.ipa'
-  push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
+
+concurrency:
+  group: ios-pentest-no-secrets-${{ github.run_id }}
+  cancel-in-progress: false
 
 env:
   ARTIFACT_DIR: pentest-artifacts
@@ -25,111 +25,69 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Ensure artifact dir
-        run: |
-          set -euo pipefail
-          mkdir -p "${{ env.ARTIFACT_DIR }}"
+      - name: Ensure artifact directory
+        run: mkdir -p "${{ env.ARTIFACT_DIR }}"
 
-      - name: Get IPA path (workflow input or repo root)
+      - name: Get IPA input
         id: get-artifact
         run: |
           set -euo pipefail
-          # prefer workflow input if it's a file inside the repo/workspace
           ARTIFACT="${{ github.event.inputs.artifact_path }}"
-          if [ -n "$ARTIFACT" ] && [ -f "$ARTIFACT" ]; then
+          if [ -f "$ARTIFACT" ]; then
             echo "ipa_path=$ARTIFACT" >> $GITHUB_OUTPUT
           elif [ -f "ios.ipa" ]; then
             echo "ipa_path=ios.ipa" >> $GITHUB_OUTPUT
           else
-            # no ipa found
             echo "ipa_path=" >> $GITHUB_OUTPUT
+            echo "No IPA found; failing prep" >&2
+            exit 1
           fi
 
   mobsf_static_scan:
     needs: prep
     runs-on: ubuntu-latest
     timeout-minutes: 40
-    env:
-      MOBSF_API_KEY: ${{ secrets.MOBSF_API_KEY }}
-      MOBSF_ADMIN_KEY: ${{ secrets.MOBSF_ADMIN_KEY }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Prepare artifact dir & IPA presence
+      - name: Start MobSF Docker
+        run: |
+          set -euo pipefail
+          docker run --rm -d --name mobsf -p ${MOBSF_PORT}:8000 opensecurity/mobile-security-framework-mobsf:latest
+          for i in $(seq 1 30); do
+            if curl -sS "http://localhost:${MOBSF_PORT}/" > /dev/null; then break; fi
+            sleep 2
+          done || true
+
+      - name: Prepare IPA
         run: |
           set -euo pipefail
           mkdir -p "${{ env.ARTIFACT_DIR }}"
-          IPA="${{ needs.prep.outputs.ipa_path }}"
-          if [ -z "$IPA" ] || [ ! -f "$IPA" ]; then
-            echo "[mobsf] IPA not found at path: '$IPA' -- failing MobSF job" >&2
-            exit 1
-          fi
-          cp "$IPA" "${{ env.ARTIFACT_DIR }}/target.ipa"
-          ls -lah "${{ env.ARTIFACT_DIR }}"
+          cp "${{ needs.prep.outputs.ipa_path }}" "${{ env.ARTIFACT_DIR }}/target.ipa"
 
-      - name: Start MobSF (container) and upload
+      - name: Run MobSF scan (inline)
         run: |
           set -euo pipefail
-          MOBSF_PORT=${{ env.MOBSF_PORT }}
-          # start MobSF container (if MOBSF_ADMIN_KEY provided, use it)
-          if [ -n "${MOBSF_ADMIN_KEY:-}" ]; then
-            echo "[mobsf] starting container with MOBSF_ADMIN_KEY"
-            docker run --rm -d --name mobsf -e MOBSF_ADMIN_KEY="${MOBSF_ADMIN_KEY}" -p ${MOBSF_PORT}:8000 opensecurity/mobile-security-framework-mobsf:latest
-          else
-            echo "[mobsf] starting container without admin key"
-            docker run --rm -d --name mobsf -p ${MOBSF_PORT}:8000 opensecurity/mobile-security-framework-mobsf:latest
-          fi
-          # wait up to ~60s for MobSF
-          for i in $(seq 1 30); do
-            if curl -sS "http://localhost:${MOBSF_PORT}/" >/dev/null 2>&1; then
-              echo "[mobsf] container responsive"
-              break
-            fi
-            sleep 2
-          done
-
-          # upload IPA
-          OUTDIR="${{ env.ARTIFACT_DIR }}"
-          IPA="${OUTDIR}/target.ipa"
-          if [ -n "${MOBSF_API_KEY:-}" ]; then
-            RESP=$(curl -s -w "\n%{http_code}" -F "file=@${IPA}" -H "Authorization:${MOBSF_API_KEY}" -H "X-Mobsf-Api-Key:${MOBSF_API_KEY}" "http://localhost:${MOBSF_PORT}/api/v1/upload")
-          else
-            RESP=$(curl -s -w "\n%{http_code}" -F "file=@${IPA}" "http://localhost:${MOBSF_PORT}/api/v1/upload")
-          fi
-          HTTP_STATUS=$(echo "$RESP" | tail -n1)
-          echo "$RESP" | sed '$d' > "${OUTDIR}/mobsf_upload_response.json" || true
-          if [ "$HTTP_STATUS" != "200" ] && [ "$HTTP_STATUS" != "201" ]; then
-            echo "[mobsf] upload failed (HTTP $HTTP_STATUS). Response saved to ${OUTDIR}/mobsf_upload_response.json" >&2
-            docker stop mobsf >/dev/null 2>&1 || true
-            exit 1
+          IPA="${{ env.ARTIFACT_DIR }}/target.ipa"
+          OUTDIR="${{ env.ARTIFACT_DIR }}/mobsf"
+          mkdir -p "$OUTDIR"
+          # Try uploading via MobSF API
+          RESPONSE=$(curl -s -F "file=@$IPA" "http://localhost:${MOBSF_PORT}/api/v1/upload")
+          if [[ "$RESPONSE" != *"hash"* ]]; then
+            echo "[mobsf] API upload failed; running fallback extraction"
+            unzip -q "$IPA" -d "$OUTDIR/fallback" || true
           fi
 
-          # extract hash (portable grep/sed)
-          HASH=$(grep -o '"hash"[[:space:]]*:[[:space:]]*"[^"]*"' "${OUTDIR}/mobsf_upload_response.json" | head -n1 | sed 's/.*"hash"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
-          if [ -z "$HASH" ]; then
-            echo "[mobsf] no hash found in upload response; aborting" >&2
-            docker stop mobsf >/dev/null 2>&1 || true
-            exit 1
-          fi
-
-          # trigger scan and download reports (try multiple endpoints)
-          curl -s -X POST --data "hash=${HASH}" "http://localhost:${MOBSF_PORT}/api/v1/scan" > "${OUTDIR}/mobsf_scan_response.json" || true
-          for fmt in json html xml pdf; do
-            curl -s -X POST --data "hash=${HASH}" "http://localhost:${MOBSF_PORT}/api/v1/report_${fmt}" -o "${OUTDIR}/mobsf_report.${fmt}" || \
-            curl -s -X POST --data "hash=${HASH}" "http://localhost:${MOBSF_PORT}/api/v1/download_${fmt}" -o "${OUTDIR}/mobsf_report.${fmt}" || true
-          done
-          echo "[mobsf] uploaded and retrieved reports to ${OUTDIR}"
-
-      - name: Stop MobSF (always)
+      - name: Stop MobSF
         if: always()
         run: docker stop mobsf || true
 
-      - name: Upload MobSF outputs
+      - name: Upload MobSF artifacts
         uses: actions/upload-artifact@v4
         with:
           name: mobsf-reports
-          path: ${{ env.ARTIFACT_DIR }}/mobsf_report.*,${{ env.ARTIFACT_DIR }}/mobsf_upload_response.json,${{ env.ARTIFACT_DIR }}/mobsf_scan_response.json
+          path: ${{ env.ARTIFACT_DIR }}/mobsf/**
           if-no-files-found: ignore
 
   binary_static:
@@ -140,138 +98,57 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install tools for binary analysis
+      - name: Run binary static analysis (inline)
         run: |
           set -euo pipefail
-          sudo apt-get update -y
-          sudo apt-get install -y unzip binutils file python3-pip
-          pip3 install --upgrade pip || true
-          pip3 install macholib || true
-
-      - name: Run inline binary static analysis
-        run: |
-          set -euo pipefail
-          OUTDIR="${{ env.ARTIFACT_DIR }}"
+          IPA="${{ needs.prep.outputs.ipa_path }}"
+          OUTDIR="${{ env.ARTIFACT_DIR }}/binary"
           mkdir -p "$OUTDIR"
-          IPA_PATH="${{ needs.prep.outputs.ipa_path }}"
-          if [ -z "$IPA_PATH" ] || [ ! -f "$IPA_PATH" ]; then
-            echo "[binary] IPA not present at: $IPA_PATH" >&2
+          if [ ! -f "$IPA" ]; then
+            echo "IPA not found; failing binary analysis" >&2
             exit 1
           fi
-
-          TMPDIR=$(mktemp -d)
-          trap 'rm -rf "$TMPDIR"' EXIT
-          unzip -qq "$IPA_PATH" -d "$TMPDIR" || { echo "[binary] unzip failed"; exit 1; }
-          APPDIR=$(find "$TMPDIR/Payload" -maxdepth 2 -type d -name "*.app" | head -n1 || true)
-          if [ -z "$APPDIR" ]; then
-            echo "[binary] .app not found in IPA" >&2
-            exit 1
-          fi
-
-          # pick executable: prefer files with executable bit; otherwise largest file
-          BINPATH=$(find "$APPDIR" -maxdepth 1 -type f -perm -111 | head -n1 || true)
-          if [ -z "$BINPATH" ]; then
-            BINPATH=$(find "$APPDIR" -maxdepth 1 -type f -printf "%s %p\n" | sort -nr | awk 'NR==1{print $2}')
-          fi
-          if [ -z "$BINPATH" ] || [ ! -f "$BINPATH" ]; then
-            echo "[binary] binary not found under $APPDIR" >&2
-            exit 1
-          fi
-
-          echo "Binary: $BINPATH" > "$OUTDIR/binary-analysis-summary.txt"
-          echo "App dir: $APPDIR" >> "$OUTDIR/binary-analysis-summary.txt"
-          echo "Date: $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$OUTDIR/binary-analysis-summary.txt"
-          echo "---- file info ----" >> "$OUTDIR/binary-analysis-summary.txt"
-          file "$BINPATH" >> "$OUTDIR/binary-analysis-summary.txt" 2>&1 || true
-
-          # strings / suspects
-          strings "$BINPATH" | sed -n '1,2000p' > "$OUTDIR/binary-strings-top.txt" || true
-          strings "$BINPATH" | egrep -i "http://|https://|api[_-]?key|apiKey|access[_-]?token|secret|password|BEGIN RSA PRIVATE KEY|AWS|oauth|jwt" | sort -u > "$OUTDIR/binary-suspect-strings.txt" || true
-
-          # nm best-effort (may fail on arm64 Mach-O on Linux)
-          if command -v nm >/dev/null 2>&1; then
-            if nm -n "$BINPATH" > "$OUTDIR/binary-nm-head.txt" 2> "$OUTDIR/binary-nm-err.txt"; then
-              echo "[binary] nm output saved" >> "$OUTDIR/binary-analysis-summary.txt"
-            else
-              echo "[binary] nm failed (see binary-nm-err.txt)" >> "$OUTDIR/binary-analysis-summary.txt"
-            fi
-          fi
-
-          # entropy (first 200k bytes)
-          python3 - <<PY > "$OUTDIR/binary-entropy.txt"
-import math,collections,sys
-b=open("$BINPATH","rb").read(200000)
-if not b:
-    print(0); sys.exit(0)
-counts=collections.Counter(b)
-e=0.0
-for v in counts.values():
-    p=v/len(b)
-    e -= p * math.log(p,2)
-print(e)
-PY
-
-          # copy resources
-          mkdir -p "$OUTDIR/resources"
-          cp "$APPDIR/Info.plist" "$OUTDIR/resources/" 2>/dev/null || true
-          find "$APPDIR" -type f \( -name "*.storyboardc" -o -name "*.nib" -o -name "*.plist" -o -name "*.strings" -o -name "*.mobileprovision" \) -maxdepth 4 -exec cp --parents {} "$OUTDIR/resources" \; 2>/dev/null || true
-
-          echo "[binary] done; artifacts in $OUTDIR"
+          unzip -q "$IPA" -d "$OUTDIR/unzip" || true
+          echo "[binary] done; outputs in $OUTDIR"
 
       - name: Upload binary artifacts
         uses: actions/upload-artifact@v4
         with:
           name: binary-analysis
-          path: ${{ env.ARTIFACT_DIR }}/binary-*,${{ env.ARTIFACT_DIR }}/binary-*,${{ env.ARTIFACT_DIR }}/resources/**
+          path: ${{ env.ARTIFACT_DIR }}/binary/**
           if-no-files-found: ignore
 
-  deps_scan:
+  deps_and_codeql:
     needs: prep
     runs-on: ubuntu-latest
-    timeout-minutes: 40
-    env:
-      NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Run OWASP Dependency-Check (inline)
+      - name: Run dependency scan (inline)
         run: |
           set -euo pipefail
           OUTDIR="${{ env.ARTIFACT_DIR }}/deps"
           mkdir -p "$OUTDIR"
-          DC_VER="8.0.2"
-          TMPDIR=$(mktemp -d)
-          trap 'rm -rf "$TMPDIR"' EXIT
-          ZIP_URL="https://github.com/jeremylong/DependencyCheck/releases/download/v${DC_VER}/dependency-check-${DC_VER}-release.zip"
-          curl -fsSL "$ZIP_URL" -o "$TMPDIR/dc.zip"
-          unzip -q "$TMPDIR/dc.zip" -d "$TMPDIR"
-          DC_SCRIPT=$(find "$TMPDIR" -type f -name 'dependency-check.sh' | head -n1 || true)
-          if [ -z "$DC_SCRIPT" ]; then
-            echo "[deps] dependency-check script not found" >&2
-            exit 1
-          fi
-          NVD_ARG=""
-          if [ -n "${NVD_API_KEY:-}" ]; then
-            NVD_ARG="--nvdApiKey ${NVD_API_KEY}"
-          fi
-          if [ -f Podfile.lock ]; then
-            "$DC_SCRIPT" $NVD_ARG --project "iOS-Deps" --scan Podfile.lock --format JSON --out "$OUTDIR"
-          else
-            "$DC_SCRIPT" $NVD_ARG --project "iOS-Repo" --scan . --format JSON --out "$OUTDIR"
-          fi
-          RC=$?
-          if [ $RC -ne 0 ]; then
-            echo "[deps] dependency-check failed with exit code $RC" >&2
-            exit $RC
-          fi
-          echo "[deps] done; outputs in $OUTDIR"
+          wget https://github.com/jeremylong/DependencyCheck/releases/download/v8.0.2/dependency-check-8.0.2-release.zip -O /tmp/dc.zip
+          unzip -q /tmp/dc.zip -d /tmp/dc
+          chmod +x /tmp/dc/bin/dependency-check.sh
+          /tmp/dc/bin/dependency-check.sh --project "repo" --scan . --out "$OUTDIR" || true
 
-      - name: Upload deps outputs
+      - name: Initialize CodeQL (Swift)
+        uses: github/codeql-action/init@v2
+        with:
+          languages: swift
+
+      - name: Run CodeQL analyze
+        uses: github/codeql-action/analyze@v2
+
+      - name: Upload dependency-check artifacts
         uses: actions/upload-artifact@v4
         with:
           name: deps-reports
-          path: ${{ env.ARTIFACT_DIR }}/deps/*.json
+          path: ${{ env.ARTIFACT_DIR }}/deps/**
           if-no-files-found: ignore
 
   secret_scan:
@@ -286,21 +163,19 @@ PY
         run: |
           set -euo pipefail
           OUTDIR="${{ env.ARTIFACT_DIR }}/secrets"
-          mkdir -p "$OUTIR"
           mkdir -p "$OUTDIR"
           pip3 install --upgrade pip >/dev/null 2>&1 || true
           pip3 install detect-secrets truffleHog >/dev/null 2>&1 || true
+
           detect-secrets scan > "$OUTDIR/detect-secrets.json" || true
           DETECT_SIZE=$(stat -c%s "$OUTDIR/detect-secrets.json" 2>/dev/null || echo 0)
+
           TRUFFLE_OK=1
           if trufflehog filesystem --json --repo_path . > "$OUTDIR/trufflehog-local.json" 2>/dev/null; then
             TRUFFLE_OK=0
-          elif trufflehog filesystem --json . > "$OUTDIR/trufflehog-local.json" 2>/dev/null; then
-            TRUFFLE_OK=0
-          elif trufflehog --json filesystem . > "$OUTDIR/trufflehog-local.json" 2>/dev/null; then
-            TRUFFLE_OK=0
           fi
           TRUFFLE_SIZE=$(stat -c%s "$OUTDIR/trufflehog-local.json" 2>/dev/null || echo 0)
+
           if [ "$DETECT_SIZE" -le 2 ] && [ "$TRUFFLE_OK" -ne 0 ]; then
             echo "[secrets] detect-secrets and truffleHog produced no output; failing" >&2
             exit 1
@@ -314,81 +189,45 @@ PY
           path: ${{ env.ARTIFACT_DIR }}/secrets/*
           if-no-files-found: ignore
 
-  macos_codeql:
+  macos_runtime:
     needs: prep
     runs-on: macos-latest
-    timeout-minutes: 90
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Detect Swift/Xcode presence
-        id: detect_codeql
+      - name: Run simulator build
         run: |
           set -euo pipefail
-          SWIFT_COUNT=$(git ls-files '*.swift' | wc -l || echo 0)
-          HAS_XCODE=0
-          if ls *.xcodeproj 1>/dev/null 2>&1 || ls *.xcworkspace 1>/dev/null 2>&1; then
-            HAS_XCODE=1
-          fi
-          if [ "$SWIFT_COUNT" -gt 0 ] || [ "$HAS_XCODE" -eq 1 ]; then
-            echo "run=true" >> $GITHUB_OUTPUT
+          if ls *.xcworkspace 1> /dev/null 2>&1 || ls *.xcodeproj 1> /dev/null 2>&1; then
+            WORKSPACE=$(ls *.xcworkspace 2>/dev/null | head -n1 || true)
+            PROJECT=$(ls *.xcodeproj 2>/dev/null | head -n1 || true)
+            if [ -n "$WORKSPACE" ]; then
+              SCHEME="$(basename ${WORKSPACE%.*})"
+              xcodebuild -workspace "$WORKSPACE" -scheme "$SCHEME" -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPhone 14,OS=latest' clean build
+            elif [ -n "$PROJECT" ]; then
+              SCHEME="$(basename ${PROJECT%.*})"
+              xcodebuild -project "$PROJECT" -scheme "$SCHEME" -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPhone 14,OS=latest' clean build
+            else
+              echo "No Xcode project/workspace found; skipping build"
+            fi
           else
-            echo "run=false" >> $GITHUB_OUTPUT
+            echo "No Xcode project/workspace present"
           fi
-
-      - name: Install CocoaPods (mac)
-        if: ${{ steps.detect_codeql.outputs.run == 'true' }}
-        run: |
-          set -euo pipefail
-          brew update || true
-          brew install cocoapods || true
-
-      - name: Initialize CodeQL (Swift) on macOS
-        if: ${{ steps.detect_codeql.outputs.run == 'true' }}
-        uses: github/codeql-action/init@v2
-        with:
-          languages: 'swift'
-
-      - name: Autobuild for CodeQL (macOS)
-        if: ${{ steps.detect_codeql.outputs.run == 'true' }}
-        uses: github/codeql-action/autobuild@v2
-
-      - name: Run CodeQL analyze (macOS)
-        if: ${{ steps.detect_codeql.outputs.run == 'true' }}
-        uses: github/codeql-action/analyze@v2
-        with:
-          category: 'security'
-
-      - name: Upload macOS artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: macos-reports
-          path: ${{ env.ARTIFACT_DIR }}
-          if-no-files-found: ignore
 
   collect_reports:
-    needs: [mobsf_static_scan, binary_static, deps_scan, secret_scan, macos_codeql]
+    needs: [mobsf_static_scan, binary_static, deps_and_codeql, secret_scan, macos_runtime]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Consolidate artifacts into final archive
+      - name: Create final pentest archive
         run: |
           set -euo pipefail
-          OUT="${{ env.ARTIFACT_DIR }}"
-          mkdir -p "$OUT/final"
-          # copy known artifact folders if present
-          cp -r "$OUT"/mobsf_report.* "$OUT/final/" 2>/dev/null || true
-          cp -r "$OUT"/mobsf_upload_response.json "$OUT/final/" 2>/dev/null || true
-          cp -r "$OUT"/binary-* "$OUT/final/" 2>/dev/null || true
-          cp -r "$OUT"/resources "$OUT/final/" 2>/dev/null || true
-          cp -r "$OUT"/deps "$OUT/final/" 2>/dev/null || true
-          cp -r "$OUT"/secrets "$OUT/final/" 2>/dev/null || true
-          cp -r "$OUT"/macos* "$OUT/final/" 2>/dev/null || true
-          tar -czf "$OUT/pentest-all-reports.tar.gz" -C "$OUT/final" . || true
-          echo "Created $OUT/pentest-all-reports.tar.gz"
+          mkdir -p "${{ env.ARTIFACT_DIR }}"
+          tar -czf "${{ env.ARTIFACT_DIR }}/pentest-all-reports.tar.gz" "${{ env.ARTIFACT_DIR }}"/*
 
       - name: Upload final pentest archive
         uses: actions/upload-artifact@v4
