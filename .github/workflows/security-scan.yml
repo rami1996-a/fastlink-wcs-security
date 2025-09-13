@@ -25,7 +25,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Ensure artifact dir
+      - name: Ensure artifact directory
         run: |
           set -euo pipefail
           mkdir -p "${{ env.ARTIFACT_DIR }}"
@@ -34,15 +34,15 @@ jobs:
         id: get-artifact
         run: |
           set -euo pipefail
-          # prefer workflow input if it's a file inside the repo/workspace
           ARTIFACT="${{ github.event.inputs.artifact_path }}"
           if [ -n "$ARTIFACT" ] && [ -f "$ARTIFACT" ]; then
             echo "ipa_path=$ARTIFACT" >> $GITHUB_OUTPUT
           elif [ -f "ios.ipa" ]; then
             echo "ipa_path=ios.ipa" >> $GITHUB_OUTPUT
           else
-            # no ipa found
             echo "ipa_path=" >> $GITHUB_OUTPUT
+            echo "No IPA found at workflow input or repo root (ios.ipa)." >&2
+            exit 1
           fi
 
   mobsf_static_scan:
@@ -56,7 +56,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Prepare artifact dir & IPA presence
+      - name: Prepare artifact dir & check IPA
         run: |
           set -euo pipefail
           mkdir -p "${{ env.ARTIFACT_DIR }}"
@@ -68,58 +68,58 @@ jobs:
           cp "$IPA" "${{ env.ARTIFACT_DIR }}/target.ipa"
           ls -lah "${{ env.ARTIFACT_DIR }}"
 
-      - name: Start MobSF (container) and upload
+      - name: Start MobSF container and upload
         run: |
           set -euo pipefail
-          MOBSF_PORT=${{ env.MOBSF_PORT }}
-          # start MobSF container (if MOBSF_ADMIN_KEY provided, use it)
+          PORT=${{ env.MOBSF_PORT }}
           if [ -n "${MOBSF_ADMIN_KEY:-}" ]; then
-            echo "[mobsf] starting container with MOBSF_ADMIN_KEY"
-            docker run --rm -d --name mobsf -e MOBSF_ADMIN_KEY="${MOBSF_ADMIN_KEY}" -p ${MOBSF_PORT}:8000 opensecurity/mobile-security-framework-mobsf:latest
+            docker run --rm -d --name mobsf -e MOBSF_ADMIN_KEY="${MOBSF_ADMIN_KEY}" -p ${PORT}:8000 opensecurity/mobile-security-framework-mobsf:latest
           else
-            echo "[mobsf] starting container without admin key"
-            docker run --rm -d --name mobsf -p ${MOBSF_PORT}:8000 opensecurity/mobile-security-framework-mobsf:latest
+            docker run --rm -d --name mobsf -p ${PORT}:8000 opensecurity/mobile-security-framework-mobsf:latest
           fi
-          # wait up to ~60s for MobSF
+
+          # wait for MobSF to start
           for i in $(seq 1 30); do
-            if curl -sS "http://localhost:${MOBSF_PORT}/" >/dev/null 2>&1; then
+            if curl -sS "http://localhost:${PORT}/" >/dev/null 2>&1; then
               echo "[mobsf] container responsive"
               break
             fi
             sleep 2
           done
 
-          # upload IPA
           OUTDIR="${{ env.ARTIFACT_DIR }}"
           IPA="${OUTDIR}/target.ipa"
+
+          # upload with optional API key
           if [ -n "${MOBSF_API_KEY:-}" ]; then
-            RESP=$(curl -s -w "\n%{http_code}" -F "file=@${IPA}" -H "Authorization:${MOBSF_API_KEY}" -H "X-Mobsf-Api-Key:${MOBSF_API_KEY}" "http://localhost:${MOBSF_PORT}/api/v1/upload")
+            UPLOAD_RAW=$(curl -s -w "\n%{http_code}" -F "file=@${IPA}" -H "Authorization:${MOBSF_API_KEY}" -H "X-Mobsf-Api-Key:${MOBSF_API_KEY}" "http://localhost:${PORT}/api/v1/upload")
           else
-            RESP=$(curl -s -w "\n%{http_code}" -F "file=@${IPA}" "http://localhost:${MOBSF_PORT}/api/v1/upload")
+            UPLOAD_RAW=$(curl -s -w "\n%{http_code}" -F "file=@${IPA}" "http://localhost:${PORT}/api/v1/upload")
           fi
-          HTTP_STATUS=$(echo "$RESP" | tail -n1)
-          echo "$RESP" | sed '$d' > "${OUTDIR}/mobsf_upload_response.json" || true
+
+          HTTP_STATUS=$(echo "$UPLOAD_RAW" | tail -n1)
+          echo "$UPLOAD_RAW" | sed '$d' > "${OUTDIR}/mobsf_upload_response.json" || true
+
           if [ "$HTTP_STATUS" != "200" ] && [ "$HTTP_STATUS" != "201" ]; then
-            echo "[mobsf] upload failed (HTTP $HTTP_STATUS). Response saved to ${OUTDIR}/mobsf_upload_response.json" >&2
+            echo "[mobsf] upload failed (HTTP $HTTP_STATUS). Saving fallback outputs and failing." >&2
+            unzip -q "$IPA" -d "${OUTDIR}/mobsf_fallback" || true
             docker stop mobsf >/dev/null 2>&1 || true
             exit 1
           fi
 
-          # extract hash (portable grep/sed)
           HASH=$(grep -o '"hash"[[:space:]]*:[[:space:]]*"[^"]*"' "${OUTDIR}/mobsf_upload_response.json" | head -n1 | sed 's/.*"hash"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
           if [ -z "$HASH" ]; then
-            echo "[mobsf] no hash found in upload response; aborting" >&2
+            echo "[mobsf] no hash in response; aborting" >&2
             docker stop mobsf >/dev/null 2>&1 || true
             exit 1
           fi
 
-          # trigger scan and download reports (try multiple endpoints)
-          curl -s -X POST --data "hash=${HASH}" "http://localhost:${MOBSF_PORT}/api/v1/scan" > "${OUTDIR}/mobsf_scan_response.json" || true
+          curl -s -X POST --data "hash=${HASH}" "http://localhost:${PORT}/api/v1/scan" > "${OUTDIR}/mobsf_scan_response.json" || true
           for fmt in json html xml pdf; do
-            curl -s -X POST --data "hash=${HASH}" "http://localhost:${MOBSF_PORT}/api/v1/report_${fmt}" -o "${OUTDIR}/mobsf_report.${fmt}" || \
-            curl -s -X POST --data "hash=${HASH}" "http://localhost:${MOBSF_PORT}/api/v1/download_${fmt}" -o "${OUTDIR}/mobsf_report.${fmt}" || true
+            curl -s -X POST --data "hash=${HASH}" "http://localhost:${PORT}/api/v1/report_${fmt}" -o "${OUTDIR}/mobsf_report.${fmt}" || \
+            curl -s -X POST --data "hash=${HASH}" "http://localhost:${PORT}/api/v1/download_${fmt}" -o "${OUTDIR}/mobsf_report.${fmt}" || true
           done
-          echo "[mobsf] uploaded and retrieved reports to ${OUTDIR}"
+          echo "[mobsf] reports saved to ${OUTDIR}"
 
       - name: Stop MobSF (always)
         if: always()
@@ -129,7 +129,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: mobsf-reports
-          path: ${{ env.ARTIFACT_DIR }}/mobsf_report.*,${{ env.ARTIFACT_DIR }}/mobsf_upload_response.json,${{ env.ARTIFACT_DIR }}/mobsf_scan_response.json
+          path: ${{ env.ARTIFACT_DIR }}/mobsf_report.*,${{ env.ARTIFACT_DIR }}/mobsf_upload_response.json,${{ env.ARTIFACT_DIR }}/mobsf_scan_response.json,${{ env.ARTIFACT_DIR }}/mobsf_fallback/**
           if-no-files-found: ignore
 
   binary_static:
@@ -140,7 +140,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install tools for binary analysis
+      - name: Install analysis utilities
         run: |
           set -euo pipefail
           sudo apt-get update -y
@@ -151,7 +151,7 @@ jobs:
       - name: Run inline binary static analysis
         run: |
           set -euo pipefail
-          OUTDIR="${{ env.ARTIFACT_DIR }}"
+          OUTDIR="${{ env.ARTIFACT_DIR }}/binary"
           mkdir -p "$OUTDIR"
           IPA_PATH="${{ needs.prep.outputs.ipa_path }}"
           if [ -z "$IPA_PATH" ] || [ ! -f "$IPA_PATH" ]; then
@@ -168,7 +168,6 @@ jobs:
             exit 1
           fi
 
-          # pick executable: prefer files with executable bit; otherwise largest file
           BINPATH=$(find "$APPDIR" -maxdepth 1 -type f -perm -111 | head -n1 || true)
           if [ -z "$BINPATH" ]; then
             BINPATH=$(find "$APPDIR" -maxdepth 1 -type f -printf "%s %p\n" | sort -nr | awk 'NR==1{print $2}')
@@ -181,37 +180,15 @@ jobs:
           echo "Binary: $BINPATH" > "$OUTDIR/binary-analysis-summary.txt"
           echo "App dir: $APPDIR" >> "$OUTDIR/binary-analysis-summary.txt"
           echo "Date: $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$OUTDIR/binary-analysis-summary.txt"
-          echo "---- file info ----" >> "$OUTDIR/binary-analysis-summary.txt"
           file "$BINPATH" >> "$OUTDIR/binary-analysis-summary.txt" 2>&1 || true
 
-          # strings / suspects
           strings "$BINPATH" | sed -n '1,2000p' > "$OUTDIR/binary-strings-top.txt" || true
           strings "$BINPATH" | egrep -i "http://|https://|api[_-]?key|apiKey|access[_-]?token|secret|password|BEGIN RSA PRIVATE KEY|AWS|oauth|jwt" | sort -u > "$OUTDIR/binary-suspect-strings.txt" || true
 
-          # nm best-effort (may fail on arm64 Mach-O on Linux)
           if command -v nm >/dev/null 2>&1; then
-            if nm -n "$BINPATH" > "$OUTDIR/binary-nm-head.txt" 2> "$OUTDIR/binary-nm-err.txt"; then
-              echo "[binary] nm output saved" >> "$OUTDIR/binary-analysis-summary.txt"
-            else
-              echo "[binary] nm failed (see binary-nm-err.txt)" >> "$OUTDIR/binary-analysis-summary.txt"
-            fi
+            nm -n "$BINPATH" > "$OUTDIR/binary-nm-head.txt" 2> "$OUTDIR/binary-nm-err.txt" || true
           fi
 
-          # entropy (first 200k bytes)
-          python3 - <<PY > "$OUTDIR/binary-entropy.txt"
-          import math,collections,sys
-          b=open("$BINPATH","rb").read(200000)
-          if not b:
-            print(0); sys.exit(0)
-            counts=collections.Counter(b)
-            e=0.0
-          for v in counts.values():
-          p=v/len(b)
-          e -= p * math.log(p,2)
-          print(e)
-          PY
-
-          # copy resources
           mkdir -p "$OUTDIR/resources"
           cp "$APPDIR/Info.plist" "$OUTDIR/resources/" 2>/dev/null || true
           find "$APPDIR" -type f \( -name "*.storyboardc" -o -name "*.nib" -o -name "*.plist" -o -name "*.strings" -o -name "*.mobileprovision" \) -maxdepth 4 -exec cp --parents {} "$OUTDIR/resources" \; 2>/dev/null || true
@@ -222,7 +199,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: binary-analysis
-          path: ${{ env.ARTIFACT_DIR }}/binary-*,${{ env.ARTIFACT_DIR }}/binary-*,${{ env.ARTIFACT_DIR }}/resources/**
+          path: ${{ env.ARTIFACT_DIR }}/binary/**,${{ env.ARTIFACT_DIR }}/binary-*
           if-no-files-found: ignore
 
   deps_scan:
@@ -286,12 +263,13 @@ jobs:
         run: |
           set -euo pipefail
           OUTDIR="${{ env.ARTIFACT_DIR }}/secrets"
-          mkdir -p "$OUTIR"
           mkdir -p "$OUTDIR"
           pip3 install --upgrade pip >/dev/null 2>&1 || true
           pip3 install detect-secrets truffleHog >/dev/null 2>&1 || true
+
           detect-secrets scan > "$OUTDIR/detect-secrets.json" || true
           DETECT_SIZE=$(stat -c%s "$OUTDIR/detect-secrets.json" 2>/dev/null || echo 0)
+
           TRUFFLE_OK=1
           if trufflehog filesystem --json --repo_path . > "$OUTDIR/trufflehog-local.json" 2>/dev/null; then
             TRUFFLE_OK=0
@@ -300,6 +278,7 @@ jobs:
           elif trufflehog --json filesystem . > "$OUTDIR/trufflehog-local.json" 2>/dev/null; then
             TRUFFLE_OK=0
           fi
+
           TRUFFLE_SIZE=$(stat -c%s "$OUTDIR/trufflehog-local.json" 2>/dev/null || echo 0)
           if [ "$DETECT_SIZE" -le 2 ] && [ "$TRUFFLE_OK" -ne 0 ]; then
             echo "[secrets] detect-secrets and truffleHog produced no output; failing" >&2
@@ -379,11 +358,10 @@ jobs:
           set -euo pipefail
           OUT="${{ env.ARTIFACT_DIR }}"
           mkdir -p "$OUT/final"
-          # copy known artifact folders if present
           cp -r "$OUT"/mobsf_report.* "$OUT/final/" 2>/dev/null || true
           cp -r "$OUT"/mobsf_upload_response.json "$OUT/final/" 2>/dev/null || true
-          cp -r "$OUT"/binary-* "$OUT/final/" 2>/dev/null || true
-          cp -r "$OUT"/resources "$OUT/final/" 2>/dev/null || true
+          cp -r "$OUT"/mobsf_scan_response.json "$OUT/final/" 2>/dev/null || true
+          cp -r "$OUT"/binary/** "$OUT/final/" 2>/dev/null || true
           cp -r "$OUT"/deps "$OUT/final/" 2>/dev/null || true
           cp -r "$OUT"/secrets "$OUT/final/" 2>/dev/null || true
           cp -r "$OUT"/macos* "$OUT/final/" 2>/dev/null || true
